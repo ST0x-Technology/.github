@@ -1,5 +1,10 @@
 <!-- Thanks for your Pull Request, please read the contributing guidelines before submitting. -->
 
+<!-- Use the snippet below for chained PRs
+> [!CAUTION]
+> Chained to #PR
+-->
+
 ## Motivation
 
 <!--
@@ -19,7 +24,8 @@ the code change.
 
 <!-- It's important you've done these, or your PR will not be considered for review -->
 By submitting this for review, I'm confirming I've done the following:
+
+- [ ] added comprehensive test coverage for any changes in logic
 - [ ] made this PR as small as possible
-- [ ] unit-tested any new functionality
 - [ ] linked any relevant issues or PRs
-- [ ] included screenshots (if this involves a change to a front-end or a dashboard)
+- [ ] included screenshots (if this involves a change to a front-end/dashboard)
