@@ -1,0 +1,184 @@
+name: release-label
+
+# The org-standard release flow (settled in st0x.liquidity#1289), as a
+# reusable workflow: pushing git tag vX.Y.Z in an app repo LABELS what that
+# repo's CI already built and attested for the tagged commit, then cuts the
+# GitHub release. It does not build and does not deploy. Refusals that keep
+# the label honest:
+#   - no image for the tagged commit        -> fail: tag a commit CI built;
+#   - no BinAuthz attestation on the digest -> fail: a version tag must
+#     never bless an unattested digest;
+#   - the version tag already names a DIFFERENT digest -> fail: a version
+#     never moves; cut a new version instead. (Same tag + same digest is
+#     tolerated, so re-runs and partially-labeled multi-image sets are
+#     safe to retry.)
+#
+# Callers (oracle, pricing, bebop, liquidity release-tag.yml) pass only
+# their identity and image set; auth, pins, and the beta component live
+# here so a flow change is one PR in one place. Call with job-level
+# permissions id-token: write + contents: write, pinned by commit SHA.
+
+on:
+  workflow_call:
+    inputs:
+      service_account:
+        description: The app's <app>-labeler SA email (t0.devops modules/ar-labeler).
+        required: true
+        type: string
+      ar_repo:
+        description: Artifact Registry repo base, e.g. europe-west3-docker.pkg.dev/t0-artifacts/t0-oracle
+        required: true
+        type: string
+      images:
+        description: Space-separated image names under ar_repo; all must verify before any is labeled.
+        required: true
+        type: string
+      attestor:
+        description: BinAuthz attestor that must have signed every digest (projects/<p>/attestors/<a>).
+        required: true
+        type: string
+      github_release:
+        description: Cut a GitHub release for the tag.
+        required: false
+        type: boolean
+        default: true
+      wif_provider:
+        description: Workload Identity provider (defaults to the t0-artifacts hub).
+        required: false
+        type: string
+        default: projects/684788085322/locations/global/workloadIdentityPools/github-actions/providers/github-oidc
+
+jobs:
+  label:
+    runs-on: ubuntu-latest
+    steps:
+      # Needed to peel the tag: on an ANNOTATED tag push GITHUB_SHA is the
+      # tag OBJECT's sha, not the commit (actions/runner#712).
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - id: auth
+        uses: google-github-actions/auth@c200f3691d83b41bf9bbd8638997a462592937ed # v2
+        with:
+          workload_identity_provider: ${{ inputs.wif_provider }}
+          service_account: ${{ inputs.service_account }}
+
+      - uses: google-github-actions/setup-gcloud@e427ad8a34f8676edf47cf7d7925499adf3eb74f # v2
+        with:
+          # attestation listing lives in the beta component.
+          install_components: beta
+
+      - name: Verify, label, release
+        env:
+          AR_REPO: ${{ inputs.ar_repo }}
+          IMAGES: ${{ inputs.images }}
+          ATTESTOR: ${{ inputs.attestor }}
+          GITHUB_RELEASE: ${{ inputs.github_release }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          case "${GITHUB_REF}" in
+            refs/tags/*) ;;
+            *) echo "::error::release-label only runs on tag refs (got ${GITHUB_REF})."; exit 1 ;;
+          esac
+          if [ -z "${IMAGES// /}" ]; then
+            echo "::error::images input is empty; refusing to cut a release that verifies and labels nothing."
+            exit 1
+          fi
+          VERSION="${GITHUB_REF_NAME}"
+          # The attestation lives where the attestor lives; never assume a project.
+          ATTESTOR_PROJECT=$(cut -d/ -f2 <<<"${ATTESTOR}")
+          # Peel to the COMMIT: for annotated tags GITHUB_SHA is the tag
+          # object, not the commit; ^{commit} handles lightweight and
+          # annotated identically.
+          COMMIT=$(git rev-parse "HEAD^{commit}")
+          echo "tag ${VERSION} -> commit ${COMMIT} (GITHUB_SHA was ${GITHUB_SHA})"
+
+          # Phase 1: resolve and verify EVERY image before tagging ANY; a
+          # failure mid-loop must not leave earlier images carrying a version
+          # label the set as a whole never earned. Infrastructure failures
+          # (IAM, transient AR errors) are reported as themselves, never as
+          # a missing image or missing attestation.
+          declare -A digest_for
+          declare -A already_labeled
+          for image in $IMAGES; do
+            if ! digest=$(gcloud artifacts docker images describe \
+                "${AR_REPO}/${image}:${COMMIT}" \
+                --format='value(image_summary.digest)' 2>"${RUNNER_TEMP}/err"); then
+              if grep -qiE "not found|NOT_FOUND" "${RUNNER_TEMP}/err"; then
+                echo "::error::no ${image} image exists for ${COMMIT}: tag a commit that CI has built (and wait for its build to finish)."
+              else
+                echo "::error::resolving ${image}:${COMMIT} failed; this is NOT a missing image (check labeler IAM / AR availability):"
+                cat "${RUNNER_TEMP}/err"
+              fi
+              exit 1
+            fi
+
+            # Exists-guard: a version never moves. Same digest is fine (re-run,
+            # or completing a partially-labeled multi-image set); a different
+            # digest is refused.
+            if existing=$(gcloud artifacts docker images describe \
+                "${AR_REPO}/${image}:${VERSION}" \
+                --format='value(image_summary.digest)' 2>"${RUNNER_TEMP}/err"); then
+              if [ "${existing}" = "${digest}" ]; then
+                already_labeled[$image]=1
+                echo "${image}:${VERSION} already points at ${digest}; leaving it."
+              else
+                echo "::error::${VERSION} already names ${image}@${existing} but this commit built ${digest}; a version never moves, cut a new version instead."
+                exit 1
+              fi
+            elif ! grep -qiE "not found|NOT_FOUND" "${RUNNER_TEMP}/err"; then
+              echo "::error::checking whether ${image}:${VERSION} already exists failed:"
+              cat "${RUNNER_TEMP}/err"
+              exit 1
+            fi
+
+            if ! attested=$(gcloud beta container binauthz attestations list \
+                --project="${ATTESTOR_PROJECT}" --attestor="${ATTESTOR}" \
+                --artifact-url="${AR_REPO}/${image}@${digest}" \
+                --limit=1 --format='value(name)' 2>"${RUNNER_TEMP}/err"); then
+              echo "::error::attestation lookup for ${image}@${digest} failed; this is NOT a missing attestation (check labeler IAM):"
+              cat "${RUNNER_TEMP}/err"
+              exit 1
+            fi
+            if [ -z "${attested}" ]; then
+              echo "::error::${image}@${digest} carries NO attestation from ${ATTESTOR}: refusing to put a version label on an unattested digest."
+              exit 1
+            fi
+            digest_for[$image]="${digest}"
+          done
+
+          # Phase 2: all verified; label whatever is not labeled yet.
+          for image in $IMAGES; do
+            if [ -n "${already_labeled[$image]:-}" ]; then continue; fi
+            gcloud artifacts docker tags add \
+              "${AR_REPO}/${image}@${digest_for[$image]}" \
+              "${AR_REPO}/${image}:${VERSION}"
+            echo "labeled ${image}@${digest_for[$image]} as ${VERSION}"
+          done
+
+          # GitHub release on the same tag, so the releases page and the
+          # registry agree. In this flow the release IS the job's product, so
+          # a failure here fails the run loudly (the labels above are already
+          # minted and idempotent, so a re-run completes cleanly).
+          if [ "${GITHUB_RELEASE}" = "true" ]; then
+            if gh release view "${VERSION}" >/dev/null 2>&1; then
+              echo "release ${VERSION} already exists; leaving it."
+              exit 0
+            fi
+            {
+              echo "Attested image digest(s) labeled \`${VERSION}\`:"
+              echo
+              for image in $IMAGES; do
+                echo "- \`${AR_REPO}/${image}@${digest_for[$image]}\`"
+              done
+              echo
+              echo "t0.devops release manifests pin the pair (\`version:\` + digest) and CI fails if they disagree; deploys always roll the digest."
+            } > "${RUNNER_TEMP}/release-notes.md"
+            if ! gh release create "${VERSION}" \
+                --target "${COMMIT}" \
+                --title "${VERSION}" \
+                --notes-file "${RUNNER_TEMP}/release-notes.md"; then
+              echo "::error::gh release create ${VERSION} failed (registry labels are minted; check GH_TOKEN and the caller's contents: write, then re-run)."
+              exit 1
+            fi
+          fi
