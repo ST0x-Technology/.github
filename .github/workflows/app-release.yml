@@ -22,7 +22,7 @@ name: app-release
 #     the label release-label.yml put on it; a config-only release re-uses
 #     the digests that are LIVE right now);
 #   - the config parses in the exact image that will read it
-#     (validate_command, run inside that image) — the config-ahead-of-image
+#     (validate_command, run inside that image); the config-ahead-of-image
 #     class of outage (liquidity, 2026-09-04) is refused here;
 #   - the PAM justification names the digest swap and the config version
 #     swap with a diff summary, because the console is the only place the
@@ -81,7 +81,7 @@ on:
         required: true
         type: string
       pam_entitlement:
-        description: "PAM entitlement id in the env project (app-deploy) — empty = no approval step (staging)."
+        description: "PAM entitlement id in the env project (app-deploy); empty = no approval step (staging)."
         required: false
         type: string
         default: ""
@@ -230,6 +230,14 @@ jobs:
           done
 
           if [ -n "$VERSION" ]; then
+            # A version label is a MUTABLE registry tag, and the labeler
+            # identity is reachable from any ref of the app repo; so for a
+            # v* release the digest is resolved by the tag's peeled COMMIT
+            # (the immutable sha tag the build job pushed) and the label
+            # must agree, else someone moved it. A staging roll passes the
+            # commit sha itself and needs no cross-check.
+            COMMIT=""
+            case "$VERSION" in v[0-9]*) COMMIT=$(git rev-parse "HEAD^{commit}") ;; esac
             for image in "${!keyof[@]}"; do
               if ! digest=$(gcloud artifacts docker images describe "${AR_REPO}/${image}:${VERSION}" \
                   --format='value(image_summary.digest)' 2>"$RUNNER_TEMP/err"); then
@@ -239,6 +247,14 @@ jobs:
                   echo "::error::resolving ${image}:${VERSION} failed (IAM / AR availability, NOT a missing label):"; cat "$RUNNER_TEMP/err"
                 fi
                 exit 1
+              fi
+              if [ -n "$COMMIT" ]; then
+                built=$(gcloud artifacts docker images describe "${AR_REPO}/${image}:${COMMIT}" \
+                  --format='value(image_summary.digest)' 2>/dev/null || true)
+                if [ "$built" != "$digest" ]; then
+                  echo "::error::${image}:${VERSION} resolves to ${digest} but the build of commit ${COMMIT} is '${built:-missing}': the version label has been moved or the checked-out ref is not the tagged commit. Refusing."
+                  exit 1
+                fi
               fi
               want["$image"]="${AR_REPO}/${image}@${digest}"
             done
@@ -282,7 +298,9 @@ jobs:
           for image in "${!want[@]}"; do
             echo "${keyof[$image]:-IMAGE}=${want[$image]}" >> "$RUNNER_TEMP/want.env"
           done
-          primary="${!keyof[*]}"; primary="${primary%% *}"
+          # The validator runs in the FIRST image the caller listed (bash
+          # associative arrays iterate in hash order, never rely on that).
+          first="${IMAGES%% *}"; primary="${first%%=*}"
           echo "primary=${want[$primary]}" >> "$GITHUB_OUTPUT"
 
       - name: Validate config inside the image it will run in
@@ -302,31 +320,33 @@ jobs:
             exit 1
           fi
 
-      - name: Publish config version
+      # Compare the candidate with the newest published version BEFORE the
+      # approval (so the justification can say what changes) and publish
+      # only AFTER it (so a denied release leaves nothing behind as the
+      # secret's newest version). Listing needs secretmanager.viewer on the
+      # secret; a failure here is an IAM problem and must not be masked.
+      - name: Compare config with the newest published version
         id: config
         if: inputs.config_file != ''
         run: |
           set -euo pipefail
           latest=$(gcloud secrets versions list "$CONFIG_SECRET" --filter='state=enabled' \
-            --sort-by=~createTime --limit=1 --format='value(name)' 2>/dev/null || true)
-          if [ -n "$latest" ] && gcloud secrets versions access "$latest" --secret "$CONFIG_SECRET" 2>/dev/null | cmp -s - "$CONFIG_FILE"; then
-            echo "config identical to version $latest; re-using it"
-            new="$latest"; diffstat="unchanged"
-          else
-            if [ -n "$latest" ]; then
-              gcloud secrets versions access "$latest" --secret "$CONFIG_SECRET" > "$RUNNER_TEMP/prev.toml" 2>/dev/null || : > "$RUNNER_TEMP/prev.toml"
-              added=$(diff "$RUNNER_TEMP/prev.toml" "$CONFIG_FILE" | grep -c '^>' || true)
-              removed=$(diff "$RUNNER_TEMP/prev.toml" "$CONFIG_FILE" | grep -c '^<' || true)
-              diffstat="+${added}/-${removed} lines vs v${latest}"
-              { echo "### config diff (v${latest} -> new)"; echo '```diff'; diff -u "$RUNNER_TEMP/prev.toml" "$CONFIG_FILE" | head -200 || true; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+            --sort-by=~createTime --limit=1 --format='value(name)')
+          reuse=""; diffstat="first version"
+          if [ -n "$latest" ]; then
+            gcloud secrets versions access "$latest" --secret "$CONFIG_SECRET" > "$RUNNER_TEMP/prev.toml"
+            if cmp -s "$RUNNER_TEMP/prev.toml" "$CONFIG_FILE"; then
+              reuse="$latest"; diffstat="unchanged"
+              echo "config identical to version $latest; it will be re-used"
             else
-              diffstat="first version"
+              diff -u "$RUNNER_TEMP/prev.toml" "$CONFIG_FILE" > "$RUNNER_TEMP/config.diff" || true
+              added=$(grep -c '^+[^+]' "$RUNNER_TEMP/config.diff" || true)
+              removed=$(grep -c '^-[^-]' "$RUNNER_TEMP/config.diff" || true)
+              diffstat="+${added}/-${removed} lines vs v${latest}"
+              { echo "### config diff (v${latest} -> new)"; echo '```diff'; head -200 "$RUNNER_TEMP/config.diff"; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
             fi
-            new=$(gcloud secrets versions add "$CONFIG_SECRET" --data-file="$CONFIG_FILE" --format='value(name)')
-            new="${new##*/}"
-            echo "published version $new ($diffstat)"
           fi
-          echo "version=$new" >> "$GITHUB_OUTPUT"
+          echo "reuse=$reuse" >> "$GITHUB_OUTPUT"
           echo "previous=${latest:-none}" >> "$GITHUB_OUTPUT"
           echo "diffstat=$diffstat" >> "$GITHUB_OUTPUT"
 
@@ -338,7 +358,7 @@ jobs:
       - name: Await PAM approval
         if: inputs.pam_entitlement != ''
         env:
-          CONFIG_VERSION: ${{ steps.config.outputs.version }}
+          CONFIG_REUSE: ${{ steps.config.outputs.reuse }}
           CONFIG_PREVIOUS: ${{ steps.config.outputs.previous }}
           CONFIG_DIFFSTAT: ${{ steps.config.outputs.diffstat }}
         run: |
@@ -372,7 +392,7 @@ jobs:
           fi
           CONFIG_LINE="CONFIG: none on this plane"
           if [ -n "$CONFIG_FILE" ]; then
-            CONFIG_LINE="CONFIG ${CONFIG_SECRET}: v${CONFIG_PREVIOUS} -> v${CONFIG_VERSION} (${CONFIG_DIFFSTAT})"
+            CONFIG_LINE="CONFIG ${CONFIG_SECRET}: v${CONFIG_PREVIOUS} -> ${CONFIG_REUSE:+v}${CONFIG_REUSE:-NEW VERSION} (${CONFIG_DIFFSTAT})"
           fi
           JUSTIFICATION=$(printf '%s\n' \
             "PRODUCTION DEPLOY ${SERVICE:-bot VM} in ${PROJECT} from ${GITHUB_REPOSITORY}." \
@@ -387,8 +407,20 @@ jobs:
           echo "Justification the approvers will see:"; echo "-----"; echo "$JUSTIFICATION"; echo "-----"
           { echo "### PAM justification"; echo '```'; echo "$JUSTIFICATION"; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
 
+          # An open grant is re-used ONLY if it carries this exact
+          # justification (a re-run of the same release): the text is the
+          # sole record of what the approver authorized, so a grant left
+          # over from a different release must be denied or revoked by a
+          # human in the console first, never ridden.
           if [ -n "$GRANT" ]; then
-            echo "Reusing open grant: $GRANT"
+            open_text=$(gcloud pam grants describe "$GRANT" --format='value(justification.unstructuredJustification)' 2>/dev/null || true)
+            if [ "$open_text" = "$JUSTIFICATION" ]; then
+              echo "Reusing open grant with the same justification: $GRANT"
+            else
+              STATE=$(gcloud pam grants describe "$GRANT" --format='value(state)' 2>/dev/null || echo unknown)
+              echo "::error::an open grant ($STATE) exists on ${ENTITLEMENT} with a DIFFERENT justification: ${GRANT}. Deny or revoke it in the GCP console (Privileged Access Manager > Grants), then re-run. Its text:"; echo "$open_text"
+              exit 1
+            fi
           else
             GRANT=$(gcloud pam grants create --entitlement="$ENTITLEMENT" --location=global \
               --requested-duration=3600s --justification="$JUSTIFICATION" --format='value(name)')
@@ -407,12 +439,27 @@ jobs:
           echo "::error::No approval within 60 minutes. Re-run this job once approved (an open grant is re-used)."
           exit 1
 
+      - name: Publish config version
+        id: publish
+        if: inputs.config_file != ''
+        env:
+          CONFIG_REUSE: ${{ steps.config.outputs.reuse }}
+        run: |
+          set -euo pipefail
+          if [ -n "$CONFIG_REUSE" ]; then
+            echo "version=$CONFIG_REUSE" >> "$GITHUB_OUTPUT"; exit 0
+          fi
+          new=$(gcloud secrets versions add "$CONFIG_SECRET" --data-file="$CONFIG_FILE" --format='value(name)')
+          new="${new##*/}"
+          echo "published version $new"
+          echo "version=$new" >> "$GITHUB_OUTPUT"
+
       # IAM propagation after a grant is uneven, so the deploy retries a
       # permission denial for up to 5 minutes instead of probing a proxy.
       - name: Deploy (Cloud Run)
         if: inputs.runtime == 'cloud-run'
         env:
-          CONFIG_VERSION: ${{ steps.config.outputs.version }}
+          CONFIG_VERSION: ${{ steps.publish.outputs.version }}
         run: |
           set -euo pipefail
           IMAGE_REF=$(sed -n 's/^IMAGE=//p' "$RUNNER_TEMP/want.env")
@@ -435,7 +482,7 @@ jobs:
       - name: Deploy (bot VM images.env)
         if: inputs.runtime == 'bot-vm'
         env:
-          CONFIG_VERSION: ${{ steps.config.outputs.version }}
+          CONFIG_VERSION: ${{ steps.publish.outputs.version }}
         run: |
           set -euo pipefail
           for i in $(seq 1 30); do
@@ -477,6 +524,8 @@ jobs:
               for want in "${wants[@]}"; do grep -qxF "${want}" <<<"$out" || grep -qF "=${want}" <<<"$out" || { adopted=false; break; }; done
               if [ -n "$CONFIG_FILE" ] && ! grep -qx "CONFIG_VERSION=${CONFIG_VERSION}" <<<"$out"; then adopted=false; fi
               if $adopted; then echo "::notice::VM adopted the release"; echo "$out" | tee -a "$GITHUB_STEP_SUMMARY"; exit 0; fi
+            elif grep -qiE "403|permission|denied" <<<"$out"; then
+              echo "::error::cannot READ deployed.env: the deploy identity lacks objectViewer on ${CONFIG_BUCKET} (t0.devops app-release-gate / staging-liquidity grants):"; echo "$out"; exit 1
             fi
             sleep 15
           done
@@ -490,4 +539,13 @@ jobs:
         run: |
           set -euo pipefail
           [ -n "${PAM_GRANT:-}" ] || exit 0
-          gcloud pam grants revoke "$PAM_GRANT" --reason="deploy succeeded: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}" >/dev/null && echo "Grant revoked: $PAM_GRANT"
+          # Revoking needs privilegedaccessmanager.grants.revoke, which the
+          # releaser does not hold (maker-recovery learned the same); the
+          # grant self-expires within the hour, and the reuse rule above
+          # never lets another release ride it, so a failed revoke is a
+          # warning, not a red deploy.
+          if gcloud pam grants revoke "$PAM_GRANT" --reason="deploy succeeded: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}" >/dev/null 2>&1; then
+            echo "Grant revoked: $PAM_GRANT"
+          else
+            echo "::warning::could not revoke ${PAM_GRANT} (needs grants.revoke); it self-expires within the hour."
+          fi
