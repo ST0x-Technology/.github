@@ -312,13 +312,24 @@ jobs:
           docker pull -q "$IMAGE_REF" >/dev/null
           ep=()
           [ -n "$VALIDATE_ENTRYPOINT" ] && ep=(--entrypoint "$VALIDATE_ENTRYPOINT")
+          # Exit 1 = the validator ran and REJECTED the config. Exit 2 = clap's
+          # usage error: this build's binary has no such validator (or an
+          # older CLI, e.g. pricing before --validate-config, liquidity before
+          # config-only validate-config): the config is NOT validated, said
+          # loudly, and boot stays the gate (traffic holds on the previous
+          # revision if it rejects the config). Anything else is a broken run.
+          set +e
           # shellcheck disable=SC2086
-          if docker run --rm -v "$PWD/$CONFIG_FILE:/candidate.toml:ro" "${ep[@]}" "$IMAGE_REF" $VALIDATE_COMMAND; then
-            echo "config OK for ${IMAGE_REF##*@}"
-          else
-            echo "::error::$CONFIG_FILE is rejected by the validator inside ${IMAGE_REF}: fix the config, or release a build that accepts it (a config must never run ahead of its binary)."
-            exit 1
-          fi
+          docker run --rm -v "$PWD/$CONFIG_FILE:/candidate.toml:ro" "${ep[@]}" "$IMAGE_REF" $VALIDATE_COMMAND
+          rc=$?
+          set -e
+          case "$rc" in
+            0) echo "config OK for ${IMAGE_REF##*@}" ;;
+            1) echo "::error::$CONFIG_FILE is rejected by the validator inside ${IMAGE_REF}: fix the config, or release a build that accepts it (a config must never run ahead of its binary)."; exit 1 ;;
+            2) echo "::warning title=config NOT validated::the binary in ${IMAGE_REF##*@} has no usable validator (usage error above); $CONFIG_FILE deploys unvalidated and boot is the gate. The next build that ships the validator closes this."
+               echo "### config NOT validated: no usable validator in ${IMAGE_REF##*@}" >> "$GITHUB_STEP_SUMMARY" ;;
+            *) echo "::error::validator run failed with exit $rc (not a config verdict)"; exit 1 ;;
+          esac
 
       # Compare the candidate with the newest published version BEFORE the
       # approval (so the justification can say what changes) and publish
