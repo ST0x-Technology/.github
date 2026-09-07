@@ -1,0 +1,493 @@
+name: app-release
+
+# The org-standard DEPLOY flow, as a reusable workflow: an app repo ships
+# image + config to one plane (staging or production, Cloud Run or bot VM)
+# with the same job, and only production blocks on a human.
+#
+#   staging      merge to the default branch -> this workflow as the app's
+#                <app>-deployer: publish deploy/config/staging.toml as a
+#                Secret Manager version, roll the freshly built digest and
+#                pin that version. No approval (fast path, as before).
+#   production   a version tag (code release), a merge touching
+#                deploy/config/production.toml (config-only release), or a
+#                workflow_dispatch on an older tag (rollback) -> this
+#                workflow as the app's <app>-releaser: same steps, but the
+#                roll waits for an approved `app-deploy` PAM grant in the
+#                env project. The identity holds NO deploy role at rest
+#                (t0.devops modules/app-releaser + app-release-gate).
+#
+# What is verified before anyone is asked to approve:
+#   - every digest about to run exists in the registry and carries the
+#     app's Binary Authorization attestation (a version tag resolves via
+#     the label release-label.yml put on it; a config-only release re-uses
+#     the digests that are LIVE right now);
+#   - the config parses in the exact image that will read it
+#     (validate_command, run inside that image) — the config-ahead-of-image
+#     class of outage (liquidity, 2026-09-04) is refused here;
+#   - the PAM justification names the digest swap and the config version
+#     swap with a diff summary, because the console is the only place the
+#     approver reads.
+#
+# Config versions are never deleted and a redeploy of identical content
+# re-uses the newest version instead of minting a duplicate, so a
+# revision pair (digest, config version) always rolls back cleanly.
+#
+# Callers pass identity + plane facts; auth, pins and the beta component
+# live here so a flow change is one PR in one place. Call with job-level
+# permissions id-token: write + contents: read, pinned by commit SHA.
+
+on:
+  workflow_call:
+    inputs:
+      environment:
+        description: "staging | production (labels only; the gate is pam_entitlement)."
+        required: true
+        type: string
+      runtime:
+        description: "cloud-run | bot-vm."
+        required: true
+        type: string
+      project:
+        description: "The env GCP project id."
+        required: true
+        type: string
+      region:
+        description: "Cloud Run region (cloud-run only)."
+        required: false
+        type: string
+        default: ""
+      service:
+        description: "Cloud Run service name (cloud-run only)."
+        required: false
+        type: string
+        default: ""
+      ar_repo:
+        description: "Artifact Registry repo base, e.g. europe-west3-docker.pkg.dev/t0-artifacts/t0-oracle"
+        required: true
+        type: string
+      images:
+        description: >-
+          cloud-run: the single image name under ar_repo (e.g. t0-oracle-server).
+          bot-vm: space-separated <image>=<IMAGES_ENV_KEY> pairs
+          (e.g. "t0-liquidity=BOT_IMAGE t0-liquidity-dashboard=DASHBOARD_IMAGE").
+        required: true
+        type: string
+      attestor:
+        description: "BinAuthz attestor that must have signed every digest (projects/<p>/attestors/<a>)."
+        required: true
+        type: string
+      service_account:
+        description: "SA to impersonate (staging <app>-deployer, production <app>-releaser)."
+        required: true
+        type: string
+      pam_entitlement:
+        description: "PAM entitlement id in the env project (app-deploy) — empty = no approval step (staging)."
+        required: false
+        type: string
+        default: ""
+      image_tag:
+        description: >-
+          Artifact Registry tag naming the digests to deploy: vX.Y.Z (a
+          release or a rollback) or the commit sha the app's build job just
+          pushed (a staging roll). Empty = derive from the ref: a v* tag ref
+          deploys that version; any other ref is a CONFIG-ONLY release that
+          keeps the live digests.
+        required: false
+        type: string
+        default: ""
+      ref:
+        description: >-
+          Git ref to take the config from (a version tag for a rollback via
+          workflow_dispatch). Empty = the ref this run was triggered on.
+        required: false
+        type: string
+        default: ""
+      config_file:
+        description: "Repo path of the config to publish (deploy/config/<env>.toml); empty = image-only plane."
+        required: false
+        type: string
+        default: ""
+      config_secret:
+        description: "Secret Manager secret id the config is published to (t0.devops modules/runtime-config secret_id)."
+        required: false
+        type: string
+        default: ""
+      config_mount:
+        description: "cloud-run: in-container path of the mounted config, e.g. /config/st0x-oracle-server.toml (runtime-config config_path)."
+        required: false
+        type: string
+        default: ""
+      config_bucket:
+        description: "bot-vm: the config bucket holding images.env / deployed.env."
+        required: false
+        type: string
+        default: ""
+      validate_command:
+        description: >-
+          Arguments run INSIDE the app image to validate the candidate config,
+          which is mounted read-only at /candidate.toml, e.g.
+          "/bin/st0x-oracle-server validate /candidate.toml". Empty = boot is
+          the only gate (say so in the caller).
+        required: false
+        type: string
+        default: ""
+      validate_entrypoint:
+        description: "Override the image entrypoint for validate_command (images whose entrypoint is the server binary)."
+        required: false
+        type: string
+        default: ""
+      wif_provider:
+        description: "Workload Identity provider (defaults to the t0-artifacts hub)."
+        required: false
+        type: string
+        default: projects/684788085322/locations/global/workloadIdentityPools/github-actions/providers/github-oidc
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    env:
+      ENVIRONMENT: ${{ inputs.environment }}
+      RUNTIME: ${{ inputs.runtime }}
+      PROJECT: ${{ inputs.project }}
+      REGION: ${{ inputs.region }}
+      SERVICE: ${{ inputs.service }}
+      AR_REPO: ${{ inputs.ar_repo }}
+      IMAGES: ${{ inputs.images }}
+      ATTESTOR: ${{ inputs.attestor }}
+      ENTITLEMENT: ${{ inputs.pam_entitlement }}
+      IMAGE_TAG_INPUT: ${{ inputs.image_tag }}
+      CONFIG_FILE: ${{ inputs.config_file }}
+      CONFIG_SECRET: ${{ inputs.config_secret }}
+      CONFIG_MOUNT: ${{ inputs.config_mount }}
+      CONFIG_BUCKET: ${{ inputs.config_bucket }}
+      VALIDATE_COMMAND: ${{ inputs.validate_command }}
+      VALIDATE_ENTRYPOINT: ${{ inputs.validate_entrypoint }}
+      CLOUDSDK_CORE_PROJECT: ${{ inputs.project }}
+    steps:
+      # The config comes from the ref being released: the tag for a code
+      # release or rollback, the default branch for a config-only release.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.ref != '' && inputs.ref || github.ref }}
+
+      - id: auth
+        uses: google-github-actions/auth@c200f3691d83b41bf9bbd8638997a462592937ed # v2
+        with:
+          workload_identity_provider: ${{ inputs.wif_provider }}
+          service_account: ${{ inputs.service_account }}
+          token_format: access_token
+
+      - uses: google-github-actions/setup-gcloud@e427ad8a34f8676edf47cf7d7925499adf3eb74f # v2
+        with:
+          install_components: beta
+
+      - name: Inputs sanity
+        run: |
+          set -euo pipefail
+          case "$RUNTIME" in
+            cloud-run) [ -n "$SERVICE" ] && [ -n "$REGION" ] || { echo "::error::cloud-run needs service + region"; exit 1; } ;;
+            bot-vm)    [ -n "$CONFIG_BUCKET" ] || { echo "::error::bot-vm needs config_bucket"; exit 1; } ;;
+            *) echo "::error::runtime must be cloud-run or bot-vm (got '$RUNTIME')"; exit 1 ;;
+          esac
+          if [ -n "$CONFIG_FILE" ]; then
+            [ -f "$CONFIG_FILE" ] || { echo "::error::config_file $CONFIG_FILE not found at the released ref"; exit 1; }
+            [ -n "$CONFIG_SECRET" ] || { echo "::error::config_file set but config_secret empty"; exit 1; }
+            if [ "$RUNTIME" = "cloud-run" ] && [ -z "$CONFIG_MOUNT" ]; then
+              echo "::error::cloud-run config needs config_mount"; exit 1
+            fi
+          fi
+          # Which release is this? VERSION is the AR tag the digests are
+          # resolved by (a v* label or a commit sha), empty for config-only.
+          VERSION="$IMAGE_TAG_INPUT"
+          if [ -z "$VERSION" ]; then
+            case "$GITHUB_REF" in
+              refs/tags/v[0-9]*) VERSION="$GITHUB_REF_NAME" ;;
+            esac
+          fi
+          if [ -n "$VERSION" ]; then
+            echo "release kind: IMAGE + CONFIG (digests tagged $VERSION)"
+          else
+            [ -n "$CONFIG_FILE" ] || { echo "::error::no image_tag and no config_file: nothing to release"; exit 1; }
+            echo "release kind: CONFIG-ONLY (live digests, config from $GITHUB_REF_NAME)"
+          fi
+          echo "VERSION=$VERSION" >> "$GITHUB_ENV"
+          gcloud auth configure-docker "${AR_REPO%%/*}" --quiet
+
+      # Resolve the digests that will run: by version label (code release,
+      # rollback) or by what is live (config-only). Verify every one is
+      # attested BEFORE asking a human for anything.
+      - name: Resolve and verify digests
+        id: digests
+        run: |
+          set -euo pipefail
+          ATTESTOR_PROJECT=$(cut -d/ -f2 <<<"$ATTESTOR")
+          declare -A want
+          # image name -> images.env key (bot-vm) / "" (cloud-run)
+          declare -A keyof
+          for spec in $IMAGES; do
+            keyof["${spec%%=*}"]="${spec#*=}"
+            [ "${spec%%=*}" = "${spec}" ] && keyof["$spec"]=""
+          done
+
+          if [ -n "$VERSION" ]; then
+            for image in "${!keyof[@]}"; do
+              if ! digest=$(gcloud artifacts docker images describe "${AR_REPO}/${image}:${VERSION}" \
+                  --format='value(image_summary.digest)' 2>"$RUNNER_TEMP/err"); then
+                if grep -qiE "not found|NOT_FOUND" "$RUNNER_TEMP/err"; then
+                  echo "::error::${image}:${VERSION} does not exist: for a version, the tag's release-label job has not labeled it (or failed); for a commit sha, the build job has not pushed it."
+                else
+                  echo "::error::resolving ${image}:${VERSION} failed (IAM / AR availability, NOT a missing label):"; cat "$RUNNER_TEMP/err"
+                fi
+                exit 1
+              fi
+              want["$image"]="${AR_REPO}/${image}@${digest}"
+            done
+          else
+            case "$RUNTIME" in
+              cloud-run)
+                image="${!keyof[*]}"
+                live=$(gcloud run services describe "$SERVICE" --region "$REGION" \
+                  --format='value(spec.template.spec.containers[0].image)')
+                case "$live" in
+                  "${AR_REPO}/${image}@sha256:"*) want["$image"]="$live" ;;
+                  *) echo "::error::live image '$live' is not a digest of ${AR_REPO}/${image}; refusing a config-only release on it"; exit 1 ;;
+                esac ;;
+              bot-vm)
+                gcloud storage cat "gs://${CONFIG_BUCKET}/images.env" > "$RUNNER_TEMP/live.env"
+                for image in "${!keyof[@]}"; do
+                  key="${keyof[$image]}"
+                  live=$(sed -n "s/^${key}=//p" "$RUNNER_TEMP/live.env" | tail -1)
+                  case "$live" in
+                    "${AR_REPO}/${image}@sha256:"*) want["$image"]="$live" ;;
+                    *) echo "::error::images.env ${key}='$live' is not a digest of ${AR_REPO}/${image}"; exit 1 ;;
+                  esac
+                done ;;
+            esac
+          fi
+
+          for image in "${!want[@]}"; do
+            ref="${want[$image]}"
+            if ! attested=$(gcloud beta container binauthz attestations list \
+                --project="$ATTESTOR_PROJECT" --attestor="$ATTESTOR" \
+                --artifact-url="$ref" --limit=1 --format='value(name)' 2>"$RUNNER_TEMP/err"); then
+              echo "::error::attestation lookup for $ref failed (IAM, NOT a missing attestation):"; cat "$RUNNER_TEMP/err"; exit 1
+            fi
+            [ -n "$attested" ] || { echo "::error::$ref carries NO attestation from $ATTESTOR; refusing to deploy it"; exit 1; }
+            echo "attested: $ref"
+          done
+
+          # Hand the map to later steps as KEY=ref lines (bot-vm) and the
+          # single ref (cloud-run).
+          : > "$RUNNER_TEMP/want.env"
+          for image in "${!want[@]}"; do
+            echo "${keyof[$image]:-IMAGE}=${want[$image]}" >> "$RUNNER_TEMP/want.env"
+          done
+          primary="${!keyof[*]}"; primary="${primary%% *}"
+          echo "primary=${want[$primary]}" >> "$GITHUB_OUTPUT"
+
+      - name: Validate config inside the image it will run in
+        if: inputs.config_file != '' && inputs.validate_command != ''
+        env:
+          IMAGE_REF: ${{ steps.digests.outputs.primary }}
+        run: |
+          set -euo pipefail
+          docker pull -q "$IMAGE_REF" >/dev/null
+          ep=()
+          [ -n "$VALIDATE_ENTRYPOINT" ] && ep=(--entrypoint "$VALIDATE_ENTRYPOINT")
+          # shellcheck disable=SC2086
+          if docker run --rm -v "$PWD/$CONFIG_FILE:/candidate.toml:ro" "${ep[@]}" "$IMAGE_REF" $VALIDATE_COMMAND; then
+            echo "config OK for ${IMAGE_REF##*@}"
+          else
+            echo "::error::$CONFIG_FILE is rejected by the validator inside ${IMAGE_REF}: fix the config, or release a build that accepts it (a config must never run ahead of its binary)."
+            exit 1
+          fi
+
+      - name: Publish config version
+        id: config
+        if: inputs.config_file != ''
+        run: |
+          set -euo pipefail
+          latest=$(gcloud secrets versions list "$CONFIG_SECRET" --filter='state=enabled' \
+            --sort-by=~createTime --limit=1 --format='value(name)' 2>/dev/null || true)
+          if [ -n "$latest" ] && gcloud secrets versions access "$latest" --secret "$CONFIG_SECRET" 2>/dev/null | cmp -s - "$CONFIG_FILE"; then
+            echo "config identical to version $latest; re-using it"
+            new="$latest"; diffstat="unchanged"
+          else
+            if [ -n "$latest" ]; then
+              gcloud secrets versions access "$latest" --secret "$CONFIG_SECRET" > "$RUNNER_TEMP/prev.toml" 2>/dev/null || : > "$RUNNER_TEMP/prev.toml"
+              added=$(diff "$RUNNER_TEMP/prev.toml" "$CONFIG_FILE" | grep -c '^>' || true)
+              removed=$(diff "$RUNNER_TEMP/prev.toml" "$CONFIG_FILE" | grep -c '^<' || true)
+              diffstat="+${added}/-${removed} lines vs v${latest}"
+              { echo "### config diff (v${latest} -> new)"; echo '```diff'; diff -u "$RUNNER_TEMP/prev.toml" "$CONFIG_FILE" | head -200 || true; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+            else
+              diffstat="first version"
+            fi
+            new=$(gcloud secrets versions add "$CONFIG_SECRET" --data-file="$CONFIG_FILE" --format='value(name)')
+            new="${new##*/}"
+            echo "published version $new ($diffstat)"
+          fi
+          echo "version=$new" >> "$GITHUB_OUTPUT"
+          echo "previous=${latest:-none}" >> "$GITHUB_OUTPUT"
+          echo "diffstat=$diffstat" >> "$GITHUB_OUTPUT"
+
+      # THE APPROVER READS THIS in the GCP console (Privileged Access
+      # Manager > Grants > Approve > "Requester's justification"): the only
+      # place they learn what approving authorizes. Plain ASCII, hard cap
+      # 1000 chars (cut to 950). Composed in shell, never via workflow
+      # expressions (the commit subject is attacker-influenceable).
+      - name: Await PAM approval
+        if: inputs.pam_entitlement != ''
+        env:
+          CONFIG_VERSION: ${{ steps.config.outputs.version }}
+          CONFIG_PREVIOUS: ${{ steps.config.outputs.previous }}
+          CONFIG_DIFFSTAT: ${{ steps.config.outputs.diffstat }}
+        run: |
+          set -euo pipefail
+          ascii() { LC_ALL=C sed -e 's/\xe2\x80\x94/-/g' -e 's/\xe2\x80\x93/-/g' -e 's/\xe2\x86\x92/->/g' | LC_ALL=C tr -cd '\11\12\15\40-\176'; }
+          GRANT=$(gcloud pam grants list --entitlement="$ENTITLEMENT" --location=global \
+            --format='value(name,state)' 2>/dev/null \
+            | awk '$2 == "ACTIVE" || $2 == "APPROVAL_AWAITED" || $2 == "ACTIVATING" {print $1; exit}') || true
+
+          SUBJECT=$(git log -1 --format=%s 2>/dev/null | ascii | cut -c1-120 || true)
+          RUN_URL="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+          IMAGE_LINES=""
+          if [ "$RUNTIME" = "cloud-run" ]; then
+            live=$(gcloud run services describe "$SERVICE" --region "$REGION" --format='value(spec.template.spec.containers[0].image)' 2>/dev/null || true)
+            new=$(sed -n 's/^IMAGE=//p' "$RUNNER_TEMP/want.env")
+            if [ "${live##*@}" = "${new##*@}" ]; then
+              IMAGE_LINES="IMAGE: unchanged (${new##*@})"
+            else
+              IMAGE_LINES=$(printf 'IMAGE ROLL - CHANGES THE CODE IN PRODUCTION\n  new: %s%s\n  old: %s' "${new##*@}" "${VERSION:+ ($VERSION)}" "${live##*@}")
+            fi
+          else
+            gcloud storage cat "gs://${CONFIG_BUCKET}/images.env" > "$RUNNER_TEMP/live.env" 2>/dev/null || : > "$RUNNER_TEMP/live.env"
+            while IFS='=' read -r key ref; do
+              old=$(sed -n "s/^${key}=//p" "$RUNNER_TEMP/live.env" | tail -1)
+              if [ "${old##*@}" = "${ref##*@}" ]; then
+                IMAGE_LINES="${IMAGE_LINES}${key}: unchanged"$'\n'
+              else
+                IMAGE_LINES="${IMAGE_LINES}${key} ROLL${VERSION:+ ($VERSION)}: ${old##*@} -> ${ref##*@}"$'\n'
+              fi
+            done < "$RUNNER_TEMP/want.env"
+          fi
+          CONFIG_LINE="CONFIG: none on this plane"
+          if [ -n "$CONFIG_FILE" ]; then
+            CONFIG_LINE="CONFIG ${CONFIG_SECRET}: v${CONFIG_PREVIOUS} -> v${CONFIG_VERSION} (${CONFIG_DIFFSTAT})"
+          fi
+          JUSTIFICATION=$(printf '%s\n' \
+            "PRODUCTION DEPLOY ${SERVICE:-bot VM} in ${PROJECT} from ${GITHUB_REPOSITORY}." \
+            "Approving lets the app's releaser roll the plane once (grant revoked on success)." \
+            "" \
+            "$IMAGE_LINES" \
+            "$CONFIG_LINE" \
+            "" \
+            "CHANGE: ${SUBJECT:-(n/a)}" \
+            "BY:     @${GITHUB_ACTOR} (${GITHUB_REF_NAME})" \
+            "Diff and logs: $RUN_URL" | ascii | head -c 950)
+          echo "Justification the approvers will see:"; echo "-----"; echo "$JUSTIFICATION"; echo "-----"
+          { echo "### PAM justification"; echo '```'; echo "$JUSTIFICATION"; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+
+          if [ -n "$GRANT" ]; then
+            echo "Reusing open grant: $GRANT"
+          else
+            GRANT=$(gcloud pam grants create --entitlement="$ENTITLEMENT" --location=global \
+              --requested-duration=3600s --justification="$JUSTIFICATION" --format='value(name)')
+            echo "Grant requested: $GRANT"
+          fi
+          echo "PAM_GRANT=$GRANT" >> "$GITHUB_ENV"
+          echo "Awaiting approval (60 min timeout)..."
+          for i in $(seq 1 120); do
+            STATE=$(gcloud pam grants describe "$GRANT" --format='value(state)')
+            case "$STATE" in
+              ACTIVE) echo "Grant approved and active."; exit 0 ;;
+              DENIED|REVOKED|ENDED|EXPIRED) echo "::error::PAM grant ${STATE} - deploy refused."; exit 1 ;;
+              *) echo "  state=${STATE} (poll ${i}/120)"; sleep 30 ;;
+            esac
+          done
+          echo "::error::No approval within 60 minutes. Re-run this job once approved (an open grant is re-used)."
+          exit 1
+
+      # IAM propagation after a grant is uneven, so the deploy retries a
+      # permission denial for up to 5 minutes instead of probing a proxy.
+      - name: Deploy (Cloud Run)
+        if: inputs.runtime == 'cloud-run'
+        env:
+          CONFIG_VERSION: ${{ steps.config.outputs.version }}
+        run: |
+          set -euo pipefail
+          IMAGE_REF=$(sed -n 's/^IMAGE=//p' "$RUNNER_TEMP/want.env")
+          args=(--region "$REGION" --image "$IMAGE_REF" --quiet)
+          if [ -n "$CONFIG_FILE" ]; then
+            args+=(--update-secrets "${CONFIG_MOUNT}=${CONFIG_SECRET}:${CONFIG_VERSION}")
+          fi
+          for i in $(seq 1 30); do
+            if gcloud run services update "$SERVICE" "${args[@]}" 2>"$RUNNER_TEMP/err"; then
+              break
+            elif grep -qiE "PERMISSION_DENIED|does not have permission|403" "$RUNNER_TEMP/err" && [ -n "$ENTITLEMENT" ] && [ "$i" -lt 30 ]; then
+              echo "  waiting for the grant to propagate (${i}/30)"; sleep 10
+            else
+              cat "$RUNNER_TEMP/err"; echo "::error::Cloud Run update failed; traffic stays on the previous revision."; exit 1
+            fi
+          done
+          gcloud run services describe "$SERVICE" --region "$REGION" \
+            --format='value(status.latestReadyRevisionName, spec.template.spec.containers[0].image)' | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - name: Deploy (bot VM images.env)
+        if: inputs.runtime == 'bot-vm'
+        env:
+          CONFIG_VERSION: ${{ steps.config.outputs.version }}
+        run: |
+          set -euo pipefail
+          for i in $(seq 1 30); do
+            GENERATION=$(gcloud storage objects describe "gs://${CONFIG_BUCKET}/images.env" --format='value(generation)')
+            gcloud storage cat "gs://${CONFIG_BUCKET}/images.env" > current.env
+            cp current.env next.env
+            while IFS='=' read -r key ref; do
+              grep -q "^${key}=" current.env || { echo "::error::images.env has no ${key} line; refusing to write"; exit 1; }
+              sed -i "s|^${key}=.*|${key}=${ref}|" next.env
+            done < "$RUNNER_TEMP/want.env"
+            if [ -n "$CONFIG_FILE" ]; then
+              grep -q '^CONFIG_VERSION=' current.env || { echo "::error::images.env has no CONFIG_VERSION line; refusing to write"; exit 1; }
+              sed -i "s|^CONFIG_VERSION=.*|CONFIG_VERSION=${CONFIG_VERSION}|" next.env
+            fi
+            echo "--- images.env ---"; cat next.env
+            if cmp -s current.env next.env; then
+              echo "::notice::images.env already carries this release; verifying adoption only"
+              break
+            fi
+            if gcloud storage cp --if-generation-match="$GENERATION" next.env "gs://${CONFIG_BUCKET}/images.env" 2>"$RUNNER_TEMP/err"; then
+              break
+            elif grep -qiE "PERMISSION_DENIED|does not have permission|403" "$RUNNER_TEMP/err" && [ -n "$ENTITLEMENT" ] && [ "$i" -lt 30 ]; then
+              echo "  waiting for the grant to propagate (${i}/30)"; sleep 10
+            elif grep -qiE "412|precondition" "$RUNNER_TEMP/err"; then
+              echo "images.env changed under us; re-reading"; sleep 5
+            else
+              cat "$RUNNER_TEMP/err"; echo "::error::could not write images.env"; exit 1
+            fi
+          done
+          if grep -q '^GATED_SERVICE_REPLICAS=0$' next.env; then
+            echo "::warning::workload is gated off (GATED_SERVICE_REPLICAS=0): images.env updated, nothing will start"; exit 0
+          fi
+          # The roll timer adopts within ~2 min, then verifies attestations,
+          # runs the migration + health gates, and publishes deployed.env.
+          mapfile -t wants < <(cut -d= -f2- "$RUNNER_TEMP/want.env")
+          for _ in $(seq 1 60); do
+            if out=$(gcloud storage cat "gs://${CONFIG_BUCKET}/deployed.env" 2>&1); then
+              adopted=true
+              for want in "${wants[@]}"; do grep -qxF "${want}" <<<"$out" || grep -qF "=${want}" <<<"$out" || { adopted=false; break; }; done
+              if [ -n "$CONFIG_FILE" ] && ! grep -qx "CONFIG_VERSION=${CONFIG_VERSION}" <<<"$out"; then adopted=false; fi
+              if $adopted; then echo "::notice::VM adopted the release"; echo "$out" | tee -a "$GITHUB_STEP_SUMMARY"; exit 0; fi
+            fi
+            sleep 15
+          done
+          echo "::error::the VM has not published this release after 15 minutes: the roll was refused or rolled back (attestation, migration or health gate). Read the box's roll timer journal."
+          exit 1
+
+      # A grant is a 60-minute window, not one run; close it once the roll
+      # is done. On failure it survives, so a re-run needs no new approval.
+      - name: Revoke PAM grant (success only)
+        if: success() && inputs.pam_entitlement != ''
+        run: |
+          set -euo pipefail
+          [ -n "${PAM_GRANT:-}" ] || exit 0
+          gcloud pam grants revoke "$PAM_GRANT" --reason="deploy succeeded: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}" >/dev/null && echo "Grant revoked: $PAM_GRANT"

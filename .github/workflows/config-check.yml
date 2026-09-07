@@ -1,0 +1,87 @@
+name: config-check
+
+# PR-time guard for an app's deploy/config/*.toml: every candidate file is
+# parsed by the validator INSIDE the newest released image (the highest
+# v* label in the app's registry), as the app's <app>-labeler (any-ref
+# trust, registry read + pull only). It catches a config that only a
+# not-yet-released binary understands before it reaches a release; the
+# release itself re-validates against the exact digest it deploys
+# (app-release.yml), so this is the early warning, not the gate.
+
+on:
+  workflow_call:
+    inputs:
+      config_files:
+        description: "Space-separated repo paths to validate."
+        required: true
+        type: string
+      ar_repo:
+        description: "Artifact Registry repo base."
+        required: true
+        type: string
+      image:
+        description: "Image name under ar_repo whose validator is used."
+        required: true
+        type: string
+      service_account:
+        description: "The app's <app>-labeler SA."
+        required: true
+        type: string
+      validate_command:
+        description: "Arguments run inside the image; the candidate is at /candidate.toml."
+        required: true
+        type: string
+      validate_entrypoint:
+        required: false
+        type: string
+        default: ""
+      wif_provider:
+        required: false
+        type: string
+        default: projects/684788085322/locations/global/workloadIdentityPools/github-actions/providers/github-oidc
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    env:
+      CONFIG_FILES: ${{ inputs.config_files }}
+      AR_REPO: ${{ inputs.ar_repo }}
+      IMAGE: ${{ inputs.image }}
+      VALIDATE_COMMAND: ${{ inputs.validate_command }}
+      VALIDATE_ENTRYPOINT: ${{ inputs.validate_entrypoint }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - id: auth
+        uses: google-github-actions/auth@c200f3691d83b41bf9bbd8638997a462592937ed # v2
+        with:
+          workload_identity_provider: ${{ inputs.wif_provider }}
+          service_account: ${{ inputs.service_account }}
+
+      - uses: google-github-actions/setup-gcloud@e427ad8a34f8676edf47cf7d7925499adf3eb74f # v2
+
+      - name: Validate against the newest released image
+        run: |
+          set -euo pipefail
+          gcloud auth configure-docker "${AR_REPO%%/*}" --quiet
+          latest=$(gcloud artifacts docker tags list "${AR_REPO}/${IMAGE}" --format='value(tag)' 2>/dev/null \
+            | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | sort -V | tail -1 || true)
+          if [ -z "$latest" ]; then
+            echo "::warning::no v* label on ${AR_REPO}/${IMAGE} yet; nothing released to validate against"; exit 0
+          fi
+          ref="${AR_REPO}/${IMAGE}:${latest}"
+          docker pull -q "$ref" >/dev/null
+          ep=()
+          [ -n "$VALIDATE_ENTRYPOINT" ] && ep=(--entrypoint "$VALIDATE_ENTRYPOINT")
+          failed=0
+          for f in $CONFIG_FILES; do
+            echo "--- $f vs $latest"
+            # shellcheck disable=SC2086
+            if docker run --rm -v "$PWD/$f:/candidate.toml:ro" "${ep[@]}" "$ref" $VALIDATE_COMMAND; then
+              echo "    OK"
+            else
+              echo "::error title=$f rejected by $latest::$f is not accepted by the newest released binary. If a newer build accepts it, release that build first (or in the same release) - a config must never run ahead of its binary."
+              failed=1
+            fi
+          done
+          exit $failed
