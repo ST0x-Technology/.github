@@ -176,6 +176,14 @@ jobs:
           workload_identity_provider: ${{ inputs.wif_provider }}
           service_account: ${{ inputs.service_account }}
           token_format: access_token
+          # The action exports CLOUDSDK_CORE_PROJECT itself and, left
+          # unset, derives it from the service account's project (the
+          # t0-artifacts hub), which overrides the job-level env and sent
+          # every gcloud call to the wrong project (st0x.pricing run
+          # 34221745810: run.services.get denied on
+          # namespaces/t0-artifacts/services/st0x-pricing). Pin it to the
+          # env project the release actually targets.
+          project_id: ${{ inputs.project }}
 
       - uses: google-github-actions/setup-gcloud@e427ad8a34f8676edf47cf7d7925499adf3eb74f # v2
         with:
