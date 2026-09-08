@@ -1,0 +1,130 @@
+name: config-check
+
+# PR-time guard for an app's deployed configs, run as the app's
+# <app>-labeler (any-ref trust, registry read + pull only):
+#   - production file(s): parsed by the validator inside the newest
+#     RELEASED image (highest v* label), i.e. the binary a config-only
+#     production release would be validated against;
+#   - staging file(s): parsed by the validator inside the newest DEFAULT
+#     BRANCH build (the image tagged with the branch head's commit sha, or
+#     the nearest built parent), i.e. what staging runs.
+# Early warning only; the release itself re-validates against the exact
+# digest it deploys (app-release.yml). Exit 1 from the validator is a
+# rejection; exit 2 (usage error) means that binary has no usable
+# validator yet and is reported as a warning, not a failure.
+
+on:
+  workflow_call:
+    inputs:
+      production_files:
+        description: "Space-separated repo paths validated against the newest released image."
+        required: false
+        type: string
+        default: ""
+      staging_files:
+        description: "Space-separated repo paths validated against the newest default-branch build."
+        required: false
+        type: string
+        default: ""
+      default_branch:
+        description: "The repo's default branch (whose latest build validates the staging files)."
+        required: true
+        type: string
+      ar_repo:
+        description: "Artifact Registry repo base."
+        required: true
+        type: string
+      image:
+        description: "Image name under ar_repo whose validator is used."
+        required: true
+        type: string
+      service_account:
+        description: "The app's <app>-labeler SA."
+        required: true
+        type: string
+      validate_command:
+        description: "Arguments run inside the image; the candidate is at /candidate.toml."
+        required: true
+        type: string
+      validate_entrypoint:
+        required: false
+        type: string
+        default: ""
+      wif_provider:
+        required: false
+        type: string
+        default: projects/684788085322/locations/global/workloadIdentityPools/github-actions/providers/github-oidc
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    env:
+      PRODUCTION_FILES: ${{ inputs.production_files }}
+      STAGING_FILES: ${{ inputs.staging_files }}
+      DEFAULT_BRANCH: ${{ inputs.default_branch }}
+      AR_REPO: ${{ inputs.ar_repo }}
+      IMAGE: ${{ inputs.image }}
+      VALIDATE_COMMAND: ${{ inputs.validate_command }}
+      VALIDATE_ENTRYPOINT: ${{ inputs.validate_entrypoint }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - id: auth
+        uses: google-github-actions/auth@c200f3691d83b41bf9bbd8638997a462592937ed # v2
+        with:
+          workload_identity_provider: ${{ inputs.wif_provider }}
+          service_account: ${{ inputs.service_account }}
+
+      - uses: google-github-actions/setup-gcloud@e427ad8a34f8676edf47cf7d7925499adf3eb74f # v2
+
+      - name: Validate each file against the image it targets
+        run: |
+          set -euo pipefail
+          gcloud auth configure-docker "${AR_REPO%%/*}" --quiet
+          ep=()
+          [ -n "$VALIDATE_ENTRYPOINT" ] && ep=(--entrypoint "$VALIDATE_ENTRYPOINT")
+          failed=0
+          check() { # $1 image ref, $2 label, $3.. files
+            local ref="$1" label="$2"; shift 2
+            docker pull -q "$ref" >/dev/null
+            for f in "$@"; do
+              echo "--- $f vs $label"
+              set +e
+              # shellcheck disable=SC2086
+              docker run --rm -v "$PWD/$f:/candidate.toml:ro" "${ep[@]}" "$ref" $VALIDATE_COMMAND
+              rc=$?
+              set -e
+              case "$rc" in
+                0) echo "    OK" ;;
+                1) echo "::error title=$f rejected by $label::$f is not accepted by that binary. If a newer build accepts it, release that build first (or in the same release) - a config must never run ahead of its binary."; failed=1 ;;
+                2) echo "::warning title=$f NOT validated::the binary in $label has no usable validator (usage error above); nothing checked." ;;
+                *) echo "::error::validator run failed with exit $rc"; failed=1 ;;
+              esac
+            done
+          }
+          if [ -n "${PRODUCTION_FILES// /}" ]; then
+            latest=$(gcloud artifacts docker tags list "${AR_REPO}/${IMAGE}" --format='value(tag)' 2>/dev/null \
+              | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | sort -V | tail -1 || true)
+            if [ -z "$latest" ]; then
+              echo "::warning::no v* label on ${AR_REPO}/${IMAGE} yet; production files not checked"
+            else
+              # shellcheck disable=SC2086
+              check "${AR_REPO}/${IMAGE}:${latest}" "release ${latest}" $PRODUCTION_FILES
+            fi
+          fi
+          if [ -n "${STAGING_FILES// /}" ]; then
+            built=""
+            for sha in $(gh api "repos/${GITHUB_REPOSITORY}/commits?sha=${DEFAULT_BRANCH}&per_page=8" --jq '.[].sha'); do
+              if gcloud artifacts docker images describe "${AR_REPO}/${IMAGE}:${sha}" --format='value(image_summary.digest)' >/dev/null 2>&1; then
+                built="$sha"; break
+              fi
+            done
+            if [ -z "$built" ]; then
+              echo "::warning::no built image for the last 8 commits of ${DEFAULT_BRANCH}; staging files not checked"
+            else
+              # shellcheck disable=SC2086
+              check "${AR_REPO}/${IMAGE}:${built}" "${DEFAULT_BRANCH} build ${built:0:7}" $STAGING_FILES
+            fi
+          fi
+          exit $failed
