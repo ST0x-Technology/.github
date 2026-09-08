@@ -229,6 +229,19 @@ jobs:
         run: |
           set -euo pipefail
           ATTESTOR_PROJECT=$(cut -d/ -f2 <<<"$ATTESTOR")
+          # images describe also queries Container Analysis metadata, which
+          # the release identity does not need. Resolve through AR tags only.
+          resolve_digest() {
+            local tags digest
+            tags=$(gcloud artifacts docker tags list "${AR_REPO}/$1" --format=json) || return
+            digest=$(jq -er --arg tag "$2" '
+              [.[] | select(.tag | endswith("/tags/" + $tag)) | .version | split("/")[-1]]
+              | if length == 0 then error("NOT_FOUND: tag does not exist")
+              elif length == 1 then .[0] else error("expected exactly one matching tag") end
+              | select(test("^sha256:[0-9a-f]{64}$"))
+            ' <<<"$tags") || return
+            printf '%s\n' "$digest"
+          }
           declare -A want
           # image name -> images.env key (bot-vm) / "" (cloud-run)
           declare -A keyof
@@ -247,8 +260,7 @@ jobs:
             COMMIT=""
             case "$VERSION" in v[0-9]*) COMMIT=$(git rev-parse "HEAD^{commit}") ;; esac
             for image in "${!keyof[@]}"; do
-              if ! digest=$(gcloud artifacts docker images describe "${AR_REPO}/${image}:${VERSION}" \
-                  --format='value(image_summary.digest)' 2>"$RUNNER_TEMP/err"); then
+              if ! digest=$(resolve_digest "$image" "$VERSION" 2>"$RUNNER_TEMP/err"); then
                 if grep -qiE "not found|NOT_FOUND" "$RUNNER_TEMP/err"; then
                   echo "::error::${image}:${VERSION} does not exist: for a version, the tag's release-label job has not labeled it (or failed); for a commit sha, the build job has not pushed it."
                 else
@@ -257,8 +269,7 @@ jobs:
                 exit 1
               fi
               if [ -n "$COMMIT" ]; then
-                built=$(gcloud artifacts docker images describe "${AR_REPO}/${image}:${COMMIT}" \
-                  --format='value(image_summary.digest)' 2>/dev/null || true)
+                built=$(resolve_digest "$image" "$COMMIT" 2>/dev/null || true)
                 if [ "$built" != "$digest" ]; then
                   echo "::error::${image}:${VERSION} resolves to ${digest} but the build of commit ${COMMIT} is '${built:-missing}': the version label has been moved or the checked-out ref is not the tagged commit. Refusing."
                   exit 1
