@@ -345,7 +345,17 @@ jobs:
           case "$rc" in
             0) echo "config OK for ${IMAGE_REF##*@}" ;;
             1) echo "::error::$CONFIG_FILE is rejected by the validator inside ${IMAGE_REF}: fix the config, or release a build that accepts it (a config must never run ahead of its binary)."; exit 1 ;;
-            2) echo "::warning title=config NOT validated::the binary in ${IMAGE_REF##*@} has no usable validator (usage error above); $CONFIG_FILE deploys unvalidated and boot is the gate. The next build that ships the validator closes this."
+            2) if [ -n "$ENTITLEMENT" ]; then
+                 # Production: an unjudged config is a refused config. On
+                 # 2026-09-08 the liquidity v1.10.0 image's validate-config
+                 # wanted --secrets, exited 2, this branch only warned, and
+                 # the config it never checked crash-looped the prod bot for
+                 # 80 minutes (RAI-2266). Ship a build whose validator can
+                 # judge the file, or release image + config together.
+                 echo "::error::the binary in ${IMAGE_REF##*@} cannot validate $CONFIG_FILE (usage error above), and production never deploys an unvalidated config. Release a version whose validator accepts these arguments (tag), or fix the caller's validate_command for this image."
+                 exit 1
+               fi
+               echo "::warning title=config NOT validated::the binary in ${IMAGE_REF##*@} has no usable validator (usage error above); $CONFIG_FILE deploys unvalidated on staging"
                echo "### config NOT validated: no usable validator in ${IMAGE_REF##*@}" >> "$GITHUB_STEP_SUMMARY" ;;
             *) echo "::error::validator run failed with exit $rc (not a config verdict)"; exit 1 ;;
           esac
