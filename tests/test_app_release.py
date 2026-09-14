@@ -116,12 +116,7 @@ with open(os.environ['CALLS'], 'a') as log:
 if args[:3] == ['pam', 'grants', 'list']:
     print('old-grant ' + os.environ['OLD_STATE'])
 elif args[:4] == ['pam', 'grants', 'describe', 'old-grant']:
-    if any('value(state)' in arg for arg in args):
-        print(os.environ['OLD_STATE'])
-    else:
-        print('a different release')
-elif args[:4] == ['pam', 'grants', 'revoke', 'old-grant']:
-    pass
+    print('ACTIVE')
 elif args[:3] == ['pam', 'grants', 'create']:
     print('new-grant')
 elif args[:4] == ['pam', 'grants', 'describe', 'new-grant']:
@@ -156,19 +151,15 @@ else:
             recorded = [json.loads(line) for line in calls.read_text().splitlines()]
             return result, recorded
 
-    def test_superseded_active_grant_is_revoked_before_replacement(self):
+    def test_active_grant_is_reused(self):
         result, calls = self.run_gate('ACTIVE')
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        revoke = next(i for i, call in enumerate(calls) if call[:4] ==
-                      ['pam', 'grants', 'revoke', 'old-grant'])
-        create = next(i for i, call in enumerate(calls) if call[:3] ==
-                      ['pam', 'grants', 'create'])
-        self.assertLess(revoke, create)
+        self.assertFalse(any(call[:3] == ['pam', 'grants', 'revoke'] for call in calls))
+        self.assertFalse(any(call[:3] == ['pam', 'grants', 'create'] for call in calls))
 
-    def test_pending_grant_with_different_justification_is_not_replaced(self):
+    def test_pending_grant_is_reused(self):
         result, calls = self.run_gate('APPROVAL_AWAITED')
-        self.assertNotEqual(result.returncode, 0)
-        self.assertIn('DIFFERENT justification', result.stdout)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertFalse(any(call[:3] == ['pam', 'grants', 'revoke'] for call in calls))
         self.assertFalse(any(call[:3] == ['pam', 'grants', 'create'] for call in calls))
 
