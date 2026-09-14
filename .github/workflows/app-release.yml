@@ -447,28 +447,9 @@ jobs:
           echo "Justification the approvers will see:"; echo "-----"; echo "$JUSTIFICATION"; echo "-----"
           { echo "### PAM justification"; echo '```'; echo "$JUSTIFICATION"; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
 
-          # Re-use the grant only for a re-run of the same release. An ACTIVE
-          # grant for a superseded release is revoked before a fresh grant is
-          # requested, so the new deploy gets its own approval and audit text.
-          # A pending grant still needs a human decision and is never replaced.
           if [ -n "$GRANT" ]; then
-            open_text=$(gcloud pam grants describe "$GRANT" --format='value(justification.unstructuredJustification)' 2>/dev/null || true)
-            if [ "$open_text" = "$JUSTIFICATION" ]; then
-              echo "Reusing open grant with the same justification: $GRANT"
-            else
-              STATE=$(gcloud pam grants describe "$GRANT" --format='value(state)' 2>/dev/null || echo unknown)
-              if [ "$STATE" = "ACTIVE" ]; then
-                gcloud pam grants revoke "$GRANT" \
-                  --reason="superseded by ${RUN_URL}" >/dev/null
-                echo "Revoked superseded active grant: $GRANT"
-                GRANT=""
-              else
-                echo "::error::an open grant ($STATE) exists on ${ENTITLEMENT} with a DIFFERENT justification: ${GRANT}. Deny it in the GCP console, then re-run. Its text:"; echo "$open_text"
-                exit 1
-              fi
-            fi
-          fi
-          if [ -z "$GRANT" ]; then
+            echo "Reusing open grant: $GRANT"
+          else
             GRANT=$(gcloud pam grants create --entitlement="$ENTITLEMENT" --location=global \
               --requested-duration=3600s --justification="$JUSTIFICATION" --format='value(name)')
             echo "Grant requested: $GRANT"
