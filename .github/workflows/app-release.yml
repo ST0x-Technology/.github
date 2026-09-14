@@ -542,9 +542,13 @@ jobs:
               echo "::notice::images.env already carries this release; verifying adoption only"
               break
             fi
+            # Within the first minute after PAM activation the bucket write
+            # can fail with an EMPTY error body, "GcsApiError('')", not a 403
+            # (st0x.liquidity run 34883655428, 2026-09-14: written 35s after
+            # activation). Treat it as the same propagation wait.
             if gcloud storage cp --if-generation-match="$GENERATION" next.env "gs://${CONFIG_BUCKET}/images.env" 2>"$RUNNER_TEMP/err"; then
               break
-            elif grep -qiE "PERMISSION_DENIED|does not have permission|403" "$RUNNER_TEMP/err" && [ -n "$ENTITLEMENT" ] && [ "$i" -lt 30 ]; then
+            elif grep -qiE "PERMISSION_DENIED|does not have permission|403|GcsApiError\(''\)" "$RUNNER_TEMP/err" && [ -n "$ENTITLEMENT" ] && [ "$i" -lt 30 ]; then
               echo "  waiting for the grant to propagate (${i}/30)"; sleep 10
             elif grep -qiE "412|precondition" "$RUNNER_TEMP/err"; then
               echo "images.env changed under us; re-reading"; sleep 5
