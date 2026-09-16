@@ -145,6 +145,7 @@ else:
                 'GITHUB_ACTOR': 'operator', 'GITHUB_REF_NAME': 'master',
                 'CONFIG_REUSE': '', 'CONFIG_PREVIOUS': '', 'CONFIG_DIFFSTAT': '',
                 'SERVICE': '', 'PROJECT': 'production', 'IMAGES': '', 'VERSION': '',
+                'RUNTIME_STATE_LEGACY_ROLLBACK': 'false',
             }
             result = subprocess.run(['bash', '-euo', 'pipefail', '-c', script],
                                     env=env, text=True, capture_output=True)
@@ -162,6 +163,71 @@ else:
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertFalse(any(call[:3] == ['pam', 'grants', 'revoke'] for call in calls))
         self.assertFalse(any(call[:3] == ['pam', 'grants', 'create'] for call in calls))
+
+
+class RuntimeStateGateTest(unittest.TestCase):
+    def run_gate(self, expected_digest):
+        step = WORKFLOW.read_text().split('      - name: Fetch and validate active runtime state\n', 1)[1]
+        script = textwrap.dedent(step.split('        run: |\n', 1)[1].split('\n      - name:', 1)[0])
+        state = b'{"schema_version":1,"proposal_id":"proposal-1","overrides":[]}'
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            fake = root / 'gcloud'
+            fake.write_text('''#!/usr/bin/env python3
+import json, os, sys
+args = sys.argv[1:]
+if args[:3] == ['storage', 'objects', 'describe']:
+    print('42')
+elif args[:2] == ['storage', 'cat']:
+    print(json.dumps({'schema_version': 1, 'secret_version': '7',
+                      'sha256': os.environ['EXPECTED_DIGEST']}))
+elif args[:3] == ['secrets', 'versions', 'access']:
+    sys.stdout.buffer.write(open(os.environ['STATE_FILE'], 'rb').read())
+else:
+    print('unexpected gcloud call: ' + repr(args), file=sys.stderr)
+    sys.exit(99)
+''')
+            fake.chmod(0o755)
+            docker = root / 'docker'
+            docker.write_text('#!/bin/sh\nexit 0\n')
+            docker.chmod(0o755)
+            state_file = root / 'state.json'
+            state_file.write_bytes(state)
+            config_file = root / 'config.toml'
+            config_file.write_text('port = 8080\n')
+            env = os.environ | {
+                'PATH': str(root) + os.pathsep + os.environ['PATH'],
+                'EXPECTED_DIGEST': expected_digest,
+                'STATE_FILE': str(state_file), 'RUNNER_TEMP': directory,
+                'RUNTIME_STATE_POINTER': 'gs://bucket/active.json',
+                'RUNTIME_STATE_SECRET': 'active-snapshots',
+                'RUNTIME_STATE_VALIDATE_COMMAND': '/bin/app --validate-spread-overrides /runtime-state.json',
+                'IMAGE_REF': 'registry/app@sha256:' + 'a' * 64,
+                'VALIDATE_ENTRYPOINT': '', 'CONFIG_FILE': str(config_file),
+                'GITHUB_ENV': str(root / 'environment'),
+            }
+            return subprocess.run(['bash', '-euo', 'pipefail', '-c', script],
+                                  env=env, text=True, capture_output=True)
+
+    def test_generation_pinned_state_is_validated(self):
+        import hashlib
+        digest = hashlib.sha256(b'{"schema_version":1,"proposal_id":"proposal-1","overrides":[]}').hexdigest()
+        result = self.run_gate(digest)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_digest_mismatch_stops_release(self):
+        result = self.run_gate('0' * 64)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('digest does not match', result.stdout)
+
+    def test_legacy_rollback_step_is_guarded(self):
+        workflow = WORKFLOW.read_text()
+        self.assertIn("if: inputs.runtime_state_pointer != '' && !inputs.runtime_state_legacy_rollback", workflow)
+        self.assertIn('[ "$RUNTIME_STATE_LEGACY_ROLLBACK" != true ]', workflow)
+        self.assertIn('RUNTIME_STATE_LEGACY_VERSIONS', workflow)
+        self.assertIn('is not an allowed pre-runtime-state release', workflow)
+        self.assertIn('RUNTIME STATE: legacy rollback to ${VERSION}', workflow)
+        self.assertIn('legacy rollback cannot reuse open grant', workflow)
 
 
 if __name__ == '__main__':
