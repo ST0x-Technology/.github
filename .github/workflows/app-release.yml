@@ -136,6 +136,31 @@ on:
         required: false
         type: string
         default: ""
+      runtime_state_pointer:
+        description: "Optional gs://bucket/object pointer to immutable runtime state that must remain valid across this release."
+        required: false
+        type: string
+        default: ""
+      runtime_state_secret:
+        description: "Secret Manager secret containing the immutable runtime-state versions named by runtime_state_pointer."
+        required: false
+        type: string
+        default: ""
+      runtime_state_validate_command:
+        description: "Arguments run in the candidate image with config at /candidate.toml and active state at /runtime-state.json."
+        required: false
+        type: string
+        default: ""
+      runtime_state_legacy_rollback:
+        description: "Skip runtime-state validation for an explicit rollback to an image predating that state contract."
+        required: false
+        type: boolean
+        default: false
+      runtime_state_legacy_versions:
+        description: "Space-separated immutable image tags that predate the runtime-state contract and may use runtime_state_legacy_rollback."
+        required: false
+        type: string
+        default: ""
       wif_provider:
         description: "Workload Identity provider (defaults to the t0-artifacts hub)."
         required: false
@@ -162,6 +187,11 @@ jobs:
       CONFIG_BUCKET: ${{ inputs.config_bucket }}
       VALIDATE_COMMAND: ${{ inputs.validate_command }}
       VALIDATE_ENTRYPOINT: ${{ inputs.validate_entrypoint }}
+      RUNTIME_STATE_POINTER: ${{ inputs.runtime_state_pointer }}
+      RUNTIME_STATE_SECRET: ${{ inputs.runtime_state_secret }}
+      RUNTIME_STATE_VALIDATE_COMMAND: ${{ inputs.runtime_state_validate_command }}
+      RUNTIME_STATE_LEGACY_ROLLBACK: ${{ inputs.runtime_state_legacy_rollback }}
+      RUNTIME_STATE_LEGACY_VERSIONS: ${{ inputs.runtime_state_legacy_versions }}
       CLOUDSDK_CORE_PROJECT: ${{ inputs.project }}
     steps:
       # The config comes from the ref being released: the tag for a code
@@ -204,6 +234,17 @@ jobs:
               echo "::error::cloud-run config needs config_mount"; exit 1
             fi
           fi
+          if [ -n "$RUNTIME_STATE_POINTER" ]; then
+            [ "$RUNTIME" = "cloud-run" ] || { echo "::error::runtime_state_pointer is supported only for cloud-run"; exit 1; }
+            if [ "$RUNTIME_STATE_LEGACY_ROLLBACK" != true ]; then
+              [ -n "$RUNTIME_STATE_SECRET" ] || { echo "::error::runtime_state_pointer needs runtime_state_secret"; exit 1; }
+              [ -n "$RUNTIME_STATE_VALIDATE_COMMAND" ] || { echo "::error::runtime_state_pointer needs runtime_state_validate_command"; exit 1; }
+              [ -n "$CONFIG_FILE" ] || { echo "::error::runtime state validation needs config_file"; exit 1; }
+            fi
+            case "$RUNTIME_STATE_POINTER" in gs://*/*) ;; *) echo "::error::runtime_state_pointer must be gs://bucket/object"; exit 1 ;; esac
+          elif [ -n "$RUNTIME_STATE_SECRET$RUNTIME_STATE_VALIDATE_COMMAND" ]; then
+            echo "::error::runtime-state inputs must be supplied together"; exit 1
+          fi
           # Which release is this? VERSION is the AR tag the digests are
           # resolved by (a v* label or a commit sha), empty for config-only.
           VERSION="$IMAGE_TAG_INPUT"
@@ -217,6 +258,15 @@ jobs:
           else
             [ -n "$CONFIG_FILE" ] || { echo "::error::no image_tag and no config_file: nothing to release"; exit 1; }
             echo "release kind: CONFIG-ONLY (live digests, config from $GITHUB_REF_NAME)"
+          fi
+          if [ "$RUNTIME_STATE_LEGACY_ROLLBACK" = true ]; then
+            [ -n "$RUNTIME_STATE_POINTER" ] || { echo "::error::legacy runtime-state rollback needs runtime_state_pointer"; exit 1; }
+            [ -n "$VERSION" ] || { echo "::error::legacy runtime-state rollback requires an explicit image tag"; exit 1; }
+            case " $RUNTIME_STATE_LEGACY_VERSIONS " in
+              *" $VERSION "*) ;;
+              *) echo "::error::$VERSION is not an allowed pre-runtime-state release"; exit 1 ;;
+            esac
+            echo "::warning::legacy rollback: runtime-state validation is disabled for $VERSION"
           fi
           echo "VERSION=$VERSION" >> "$GITHUB_ENV"
           gcloud auth configure-docker "${AR_REPO%%/*}" --quiet
@@ -360,6 +410,31 @@ jobs:
             *) echo "::error::validator run failed with exit $rc (not a config verdict)"; exit 1 ;;
           esac
 
+      - name: Fetch and validate active runtime state
+        if: inputs.runtime_state_pointer != '' && !inputs.runtime_state_legacy_rollback
+        env:
+          IMAGE_REF: ${{ steps.digests.outputs.primary }}
+        run: |
+          set -euo pipefail
+          generation=$(gcloud storage objects describe "$RUNTIME_STATE_POINTER" --format='value(generation)')
+          [ -n "$generation" ] || { echo "::error::runtime-state pointer has no generation"; exit 1; }
+          gcloud storage cat "${RUNTIME_STATE_POINTER}#${generation}" > "$RUNNER_TEMP/runtime-state-pointer.json"
+          version=$(jq -er '.secret_version | select(test("^[1-9][0-9]*$"))' "$RUNNER_TEMP/runtime-state-pointer.json")
+          expected=$(jq -er '.sha256 | ascii_downcase | select(test("^[0-9a-f]{64}$"))' "$RUNNER_TEMP/runtime-state-pointer.json")
+          gcloud secrets versions access "$version" --secret "$RUNTIME_STATE_SECRET" > "$RUNNER_TEMP/runtime-state.json"
+          actual=$(sha256sum "$RUNNER_TEMP/runtime-state.json" | cut -d' ' -f1)
+          [ "$actual" = "$expected" ] || { echo "::error::runtime-state digest does not match the generation-pinned pointer"; exit 1; }
+          docker pull -q "$IMAGE_REF" >/dev/null
+          ep=()
+          [ -n "$VALIDATE_ENTRYPOINT" ] && ep=(--entrypoint "$VALIDATE_ENTRYPOINT")
+          # shellcheck disable=SC2086
+          docker run --rm \
+            -v "$PWD/$CONFIG_FILE:/candidate.toml:ro" \
+            -v "$RUNNER_TEMP/runtime-state.json:/runtime-state.json:ro" \
+            "${ep[@]}" "$IMAGE_REF" $RUNTIME_STATE_VALIDATE_COMMAND
+          echo "RUNTIME_STATE_GENERATION=$generation" >> "$GITHUB_ENV"
+          echo "active runtime state v${version} at pointer generation ${generation} is valid for ${IMAGE_REF##*@}"
+
       # Compare the candidate with the newest published version BEFORE the
       # approval (so the justification can say what changes) and publish
       # only AFTER it (so a denied release leaves nothing behind as the
@@ -386,9 +461,11 @@ jobs:
               { echo "### config diff (v${latest} -> new)"; echo '```diff'; head -200 "$RUNNER_TEMP/config.diff"; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
             fi
           fi
-          echo "reuse=$reuse" >> "$GITHUB_OUTPUT"
-          echo "previous=${latest:-none}" >> "$GITHUB_OUTPUT"
-          echo "diffstat=$diffstat" >> "$GITHUB_OUTPUT"
+          {
+            echo "reuse=$reuse"
+            echo "previous=${latest:-none}"
+            echo "diffstat=$diffstat"
+          } >> "$GITHUB_OUTPUT"
 
       # THE APPROVER READS THIS in the GCP console (Privileged Access
       # Manager > Grants > Approve > "Requester's justification"): the only
@@ -434,12 +511,17 @@ jobs:
           if [ -n "$CONFIG_FILE" ]; then
             CONFIG_LINE="CONFIG ${CONFIG_SECRET}: v${CONFIG_PREVIOUS} -> ${CONFIG_REUSE:+v}${CONFIG_REUSE:-NEW VERSION} (${CONFIG_DIFFSTAT})"
           fi
+          RUNTIME_STATE_LINE=""
+          if [ "$RUNTIME_STATE_LEGACY_ROLLBACK" = true ]; then
+            RUNTIME_STATE_LINE="RUNTIME STATE: legacy rollback to ${VERSION}; validation disabled"
+          fi
           JUSTIFICATION=$(printf '%s\n' \
             "PRODUCTION DEPLOY ${SERVICE:-bot VM} in ${PROJECT} from ${GITHUB_REPOSITORY}." \
             "Approving lets the app's releaser roll the plane once (grant revoked on success)." \
             "" \
             "$IMAGE_LINES" \
             "$CONFIG_LINE" \
+            "$RUNTIME_STATE_LINE" \
             "" \
             "CHANGE: ${SUBJECT:-(n/a)}" \
             "BY:     @${GITHUB_ACTOR} (${GITHUB_REF_NAME})" \
@@ -447,7 +529,10 @@ jobs:
           echo "Justification the approvers will see:"; echo "-----"; echo "$JUSTIFICATION"; echo "-----"
           { echo "### PAM justification"; echo '```'; echo "$JUSTIFICATION"; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
 
-          if [ -n "$GRANT" ]; then
+          if [ -n "$GRANT" ] && [ "$RUNTIME_STATE_LEGACY_ROLLBACK" = true ]; then
+            echo "::error::legacy rollback cannot reuse open grant $GRANT because its approval text does not disclose this bypass; close it and rerun"
+            exit 1
+          elif [ -n "$GRANT" ]; then
             echo "Reusing open grant: $GRANT"
           else
             GRANT=$(gcloud pam grants create --entitlement="$ENTITLEMENT" --location=global \
@@ -460,8 +545,9 @@ jobs:
             STATE=$(gcloud pam grants describe "$GRANT" --format='value(state)')
             case "$STATE" in
               ACTIVE) echo "Grant approved and active."; exit 0 ;;
-              DENIED|REVOKED|ENDED|EXPIRED) echo "::error::PAM grant ${STATE} - deploy refused."; exit 1 ;;
-              *) echo "  state=${STATE} (poll ${i}/120)"; sleep 30 ;;
+              APPROVAL_AWAITED|SCHEDULED|ACTIVATING) echo "  state=${STATE} (poll ${i}/120)"; sleep 30 ;;
+              DENIED|REVOKED|ENDED|EXPIRED|WITHDRAWN|ACTIVATION_FAILED) echo "::error::PAM grant ${STATE} - deploy refused."; exit 1 ;;
+              *) echo "::error::unexpected PAM grant state '${STATE:-empty}' - deploy refused."; exit 1 ;;
             esac
           done
           echo "::error::No approval within 60 minutes. Re-run this job once approved (an open grant is re-used)."
@@ -490,6 +576,10 @@ jobs:
           CONFIG_VERSION: ${{ steps.publish.outputs.version }}
         run: |
           set -euo pipefail
+          if [ -n "$RUNTIME_STATE_POINTER" ] && [ "$RUNTIME_STATE_LEGACY_ROLLBACK" != true ]; then
+            live_generation=$(gcloud storage objects describe "$RUNTIME_STATE_POINTER" --format='value(generation)')
+            [ "$live_generation" = "$RUNTIME_STATE_GENERATION" ] || { echo "::error::runtime-state pointer changed after validation; rerun the release"; exit 1; }
+          fi
           IMAGE_REF=$(sed -n 's/^IMAGE=//p' "$RUNNER_TEMP/want.env")
           args=(--region "$REGION" --image "$IMAGE_REF" --quiet)
           if [ -n "$CONFIG_FILE" ]; then
