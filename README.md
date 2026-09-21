@@ -7,6 +7,7 @@ caller; the logic lives here so a flow change is one PR in one place.
 |---|---|---|
 | `release-label.yml` | tag `vX.Y.Z` labels the digests CI built and attested for that commit, cuts the GitHub release | `<app>-labeler` |
 | `app-release.yml` | deploys image + config to one plane: staging on merge, production behind a PAM grant (`app-deploy` entitlement in the env project) | `<app>-deployer` (staging), `<app>-releaser` (production) |
+| `externally-merged.yml` | labels PRs the Graphite merge queue closed (not merged) as `externally-merged`, so Linear marks their issues done | `GITHUB_TOKEN` |
 | `config-check.yml` | PR guard: candidate `deploy/config/*.toml` files parsed by the validator inside the newest released image | `<app>-labeler` |
 
 Identities and gates are Terraform in `T0Trade/t0.devops`
