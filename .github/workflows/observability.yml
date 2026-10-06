@@ -63,14 +63,16 @@ jobs:
           app, service = os.environ["APP"], os.environ["SERVICE"]
           bad = []
           files = glob.glob("observability/alerting/*.yml")
+          if files != [f"observability/alerting/{app}.rules.yml"]:
+              bad.append(f"the one rules file is observability/alerting/{app}.rules.yml, found {files}")
+          rules = 0
           for f in files:
-              if not os.path.basename(f).startswith(app + "."):
-                  bad.append(f"{f}: this repo's rules files are observability/alerting/{app}.*.yml")
               d = yaml.safe_load(open(f)) or {}
               extra = set(d) - {"apiVersion", "groups", "deleteRules"}
               if extra:
                   bad.append(f"{f}: only groups and deleteRules belong here, not {sorted(extra)}")
               for g in d.get("groups") or []:
+                  rules += len(g.get("rules") or [])
                   if g.get("folder") != "Alerts":
                       bad.append(f"{f}: group {g.get('name')} must sit in the Alerts folder")
                   for r in g.get("rules") or []:
@@ -78,7 +80,8 @@ jobs:
                           bad.append(f"{f}: rule {r.get('uid')} must carry service: {service}")
                       if "notification_settings" in r:
                           bad.append(f"{f}: rule {r.get('uid')} may not override routing")
-          print("\n".join(bad) or f"{len(files)} rules file(s) in scope")
+          print("\n".join(bad) or f"{rules} rules in scope")
+          open(os.environ["GITHUB_ENV"], "a").write(f"WANT_RULES={rules}\n")
           sys.exit(1 if bad else 0)
           PY
 
@@ -119,7 +122,7 @@ jobs:
             grep -E 'level=error' grafana.log || tail -20 grafana.log
             exit 1
           fi
-          want_rules=$(cat observability/alerting/*.yml 2>/dev/null | grep -cE '^\s+- uid:' || true)
+          want_rules=${WANT_RULES:-0}
           want_boards=$(find observability/dashboards -name '*.json' | wc -l)
           got_rules=$(curl -sf -u admin:check localhost:3000/api/v1/provisioning/alert-rules | python3 -c 'import json,sys; print(len(json.load(sys.stdin)))')
           got_boards=$(curl -sf -u admin:check 'localhost:3000/api/search?type=dash-db&limit=5000' | python3 -c 'import json,sys; print(len(json.load(sys.stdin)))')
@@ -131,7 +134,10 @@ jobs:
           fi
 
   deploy:
-    if: github.event_name != 'pull_request'
+    # A push to the default branch, or a hand run from it. The identity only
+    # answers to that branch anyway; this keeps a hand run from another
+    # branch from failing late instead of early.
+    if: github.event_name != 'pull_request' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
     needs: check
     runs-on: ubuntu-latest
     env:
@@ -149,10 +155,9 @@ jobs:
       - name: Upload dashboards and alert rules
         run: |
           set -euo pipefail
-          if [ -d "observability/dashboards/$APP" ]; then
-            gcloud -q storage rsync --recursive --delete-unmatched-destination-objects \
-              "observability/dashboards/$APP" "$BUCKET/grafana/dashboards/$APP"
-          fi
-          for f in observability/alerting/"$APP".*.yml; do
-            gcloud -q storage cp "$f" "$BUCKET/grafana/alerting/$(basename "$f")"
-          done
+          # An absent folder still syncs, as empty: deleting the last board
+          # here deletes it there too.
+          mkdir -p "observability/dashboards/$APP"
+          gcloud -q storage rsync --recursive --delete-unmatched-destination-objects \
+            "observability/dashboards/$APP" "$BUCKET/grafana/dashboards/$APP"
+          gcloud -q storage cp "observability/alerting/$APP.rules.yml" "$BUCKET/grafana/alerting/$APP.rules.yml"
