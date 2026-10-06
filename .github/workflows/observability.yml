@@ -1,0 +1,158 @@
+name: observability
+
+# Ships an app repo's Grafana content to the T0 observability box: the
+# dashboards under observability/dashboards/<app>/ (its Grafana folder) and
+# the alert rules in observability/alerting/<app>.rules.yml go into the config
+# bucket the box syncs every minute (T0Trade/t0.devops,
+# terraform/production-observability). Dashboards reload within about 30
+# seconds; a rules change restarts Grafana.
+#
+# Identity: <app>-obs-deploy@t0-observability, reachable only from the app
+# repo's default branch, allowed to write only that folder and that file in
+# the bucket and nothing else (t0.devops, assetloop.tf).
+#
+# The check job runs on every call and provisions the same files into a
+# throwaway Grafana first: a rules file Grafana refuses would otherwise take
+# the real one down at restart. It also keeps the file in scope, because the
+# file format is Grafana's whole alerting schema: rule groups and deleteRules
+# only, in the Alerts folder, labelled for this service, no per-rule routing
+# override. Contact points and who gets paged stay a devops change.
+
+on:
+  workflow_call:
+    inputs:
+      app:
+        description: "The app's name: its Grafana folder, its rules file prefix and its deploy identity."
+        required: true
+        type: string
+      service:
+        description: "The `service` label every rule must carry (routes the Zulip channel). Defaults to app."
+        required: false
+        type: string
+        default: ""
+      bucket:
+        required: false
+        type: string
+        default: gs://t0-observability-config
+      grafana_image:
+        description: "The image the box runs; the check provisions into the same one."
+        required: false
+        type: string
+        default: grafana/grafana:13.1.0
+      wif_provider:
+        required: false
+        type: string
+        default: projects/674601915743/locations/global/workloadIdentityPools/github-actions/providers/github-oidc
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    env:
+      APP: ${{ inputs.app }}
+      SERVICE: ${{ inputs.service || inputs.app }}
+      GRAFANA_IMAGE: ${{ inputs.grafana_image }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Only rule groups, in the Alerts folder, labelled for this service
+        run: |
+          python3 - <<'PY'
+          import glob, os, sys, yaml
+          app, service = os.environ["APP"], os.environ["SERVICE"]
+          bad = []
+          files = glob.glob("observability/alerting/*.yml")
+          for f in files:
+              if not os.path.basename(f).startswith(app + "."):
+                  bad.append(f"{f}: this repo's rules files are observability/alerting/{app}.*.yml")
+              d = yaml.safe_load(open(f)) or {}
+              extra = set(d) - {"apiVersion", "groups", "deleteRules"}
+              if extra:
+                  bad.append(f"{f}: only groups and deleteRules belong here, not {sorted(extra)}")
+              for g in d.get("groups") or []:
+                  if g.get("folder") != "Alerts":
+                      bad.append(f"{f}: group {g.get('name')} must sit in the Alerts folder")
+                  for r in g.get("rules") or []:
+                      if (r.get("labels") or {}).get("service") != service:
+                          bad.append(f"{f}: rule {r.get('uid')} must carry service: {service}")
+                      if "notification_settings" in r:
+                          bad.append(f"{f}: rule {r.get('uid')} may not override routing")
+          print("\n".join(bad) or f"{len(files)} rules file(s) in scope")
+          sys.exit(1 if bad else 0)
+          PY
+
+      - name: Provision the content into a throwaway Grafana
+        run: |
+          set -euo pipefail
+          mkdir -p prov/datasources prov/dashboards observability/dashboards observability/alerting
+          # The box's fixed datasource uids, as stand-ins: provisioning checks
+          # that a rule's datasource exists, not that it answers.
+          cat > prov/datasources/datasources.yaml <<'YAML'
+          apiVersion: 1
+          datasources:
+            - { name: VictoriaMetrics, type: prometheus, uid: victoriametrics, url: http://victoriametrics:8428 }
+            - { name: CloudMonitoring, type: stackdriver, uid: cloudmon, jsonData: { authenticationType: gce } }
+          YAML
+          cat > prov/dashboards/provider.yaml <<'YAML'
+          apiVersion: 1
+          providers:
+            - name: check
+              type: file
+              options: { path: /etc/grafana/dashboards, foldersFromFilesStructure: true }
+          YAML
+          docker run -d --name grafana -p 3000:3000 -e GF_SECURITY_ADMIN_PASSWORD=check \
+            -v "$PWD/prov/datasources:/etc/grafana/provisioning/datasources:ro" \
+            -v "$PWD/prov/dashboards:/etc/grafana/provisioning/dashboards:ro" \
+            -v "$PWD/observability/alerting:/etc/grafana/provisioning/alerting:ro" \
+            -v "$PWD/observability/dashboards:/etc/grafana/dashboards:ro" \
+            "$GRAFANA_IMAGE"
+          for _ in $(seq 1 60); do
+            curl -sf localhost:3000/api/health >/dev/null && break
+            [ "$(docker inspect -f '{{.State.Running}}' grafana)" = true ] || break
+            sleep 2
+          done
+          sleep 5
+          docker logs grafana > grafana.log 2>&1
+          if [ "$(docker inspect -f '{{.State.Running}}' grafana)" != true ]; then
+            echo "::error::Grafana refused to start on this content"
+            grep -E 'level=error' grafana.log || tail -20 grafana.log
+            exit 1
+          fi
+          want_rules=$(cat observability/alerting/*.yml 2>/dev/null | grep -cE '^\s+- uid:' || true)
+          want_boards=$(find observability/dashboards -name '*.json' | wc -l)
+          got_rules=$(curl -sf -u admin:check localhost:3000/api/v1/provisioning/alert-rules | python3 -c 'import json,sys; print(len(json.load(sys.stdin)))')
+          got_boards=$(curl -sf -u admin:check 'localhost:3000/api/search?type=dash-db&limit=5000' | python3 -c 'import json,sys; print(len(json.load(sys.stdin)))')
+          echo "rules: $got_rules of $want_rules; dashboards: $got_boards of $want_boards"
+          if [ "$got_rules" != "$want_rules" ] || [ "$got_boards" != "$want_boards" ]; then
+            echo "::error::not everything provisioned; Grafana's own words follow"
+            grep -E 'logger=(provisioning|ngalert)' grafana.log | grep -E 'level=(warn|error)' || true
+            exit 1
+          fi
+
+  deploy:
+    if: github.event_name != 'pull_request'
+    needs: check
+    runs-on: ubuntu-latest
+    env:
+      APP: ${{ inputs.app }}
+      BUCKET: ${{ inputs.bucket }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Authenticate to GCP
+        uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v3.0.0
+        with:
+          workload_identity_provider: ${{ inputs.wif_provider }}
+          service_account: ${{ inputs.app }}-obs-deploy@t0-observability.iam.gserviceaccount.com
+      - name: Upload dashboards and alert rules
+        run: |
+          set -euo pipefail
+          if [ -d "observability/dashboards/$APP" ]; then
+            gcloud -q storage rsync --recursive --delete-unmatched-destination-objects \
+              "observability/dashboards/$APP" "$BUCKET/grafana/dashboards/$APP"
+          fi
+          for f in observability/alerting/"$APP".*.yml; do
+            gcloud -q storage cp "$f" "$BUCKET/grafana/alerting/$(basename "$f")"
+          done
