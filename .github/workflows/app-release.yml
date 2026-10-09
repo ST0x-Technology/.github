@@ -4,17 +4,32 @@ name: app-release
 # image + config to one plane (staging or production, Cloud Run or bot VM)
 # with the same job, and only production blocks on a human.
 #
-#   staging      merge to the default branch -> this workflow as the app's
-#                <app>-deployer: publish deploy/config/staging.toml as a
-#                Secret Manager version, roll the freshly built digest and
-#                pin that version. No approval (fast path, as before).
-#   production   a version tag (code release), a merge touching
-#                deploy/config/production.toml (config-only release), or a
-#                workflow_dispatch on an older tag (rollback) -> this
-#                workflow as the app's <app>-releaser: same steps, but the
-#                roll waits for an approved `app-deploy` PAM grant in the
-#                env project. The identity holds NO deploy role at rest
-#                (t0.devops modules/app-releaser + app-release-gate).
+# This file's only trigger is `workflow_call`. It never starts by itself on
+# a tag, a merge or a dispatch: the calling workflow's own `on:` decides
+# when each plane deploys.
+#
+#   staging      the app's build workflow calls this as the app's
+#                <app>-deployer when its own `on:` fires (normally a merge
+#                to the default branch; some callers also allow a manual
+#                dispatch), with image_tag set to the commit sha it just
+#                built: publish deploy/config/staging.toml as a Secret
+#                Manager version, roll that digest and pin that version. No
+#                approval (fast path, as before).
+#   production   the app's release workflow calls this as the app's
+#                <app>-releaser. A non-empty image_tag selects the digests:
+#                vX.Y.Z is a code release, or a rollback when it is an
+#                older version. With image_tag empty, the ref the run was
+#                triggered on (GITHUB_REF) decides: a v[0-9]* tag is a code
+#                release of that version, and any other ref is a
+#                config-only release of config_file onto the live digests.
+#                The `ref` input only picks the checkout the config comes
+#                from and never selects digests, so a caller that leaves
+#                image_tag empty on a branch ref publishes config only.
+#                Same steps as
+#                staging, but the roll waits for an approved `app-deploy`
+#                PAM grant in the env project. The identity holds NO deploy
+#                role at rest (t0.devops modules/app-releaser +
+#                app-release-gate).
 #
 # What is verified before anyone is asked to approve:
 #   - every digest about to run exists in the registry and carries the
@@ -97,8 +112,10 @@ on:
         default: ""
       ref:
         description: >-
-          Git ref to take the config from (a version tag for a rollback via
-          workflow_dispatch). Empty = the ref this run was triggered on.
+          Git ref to take the config from. It only selects the checkout and
+          never selects digests. For a rollback, set ref to the matching
+          version tag (or its commit) and image_tag to the version. Empty =
+          the ref this run was triggered on.
         required: false
         type: string
         default: ""
