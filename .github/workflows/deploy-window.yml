@@ -10,10 +10,8 @@ name: deploy-window
 # every digest must carry the app's attestation, and the roll itself is the
 # same as with a one-off approval.
 #
-# Loopyloupe starts this through a caller in the app repo
-# (workflow_dispatch on the default branch) for the person who asked, who
-# is named in the justification. Anyone with write access can start the
-# same caller by hand from the Actions tab.
+# A caller in the app repo starts this (workflow_dispatch on the default
+# branch) for the person who asked, who is named in the justification.
 #
 # Callers pass the plane's identity facts and the four request fields, with
 # job-level permissions id-token: write + contents: read, pinned by SHA.
@@ -107,8 +105,9 @@ jobs:
             "From $(fmt UTC "$START") to $(fmt UTC "$END") UTC ($(fmt Europe/Istanbul "$START") to $(fmt Europe/Istanbul "$END") Istanbul), ${HOURS} h." \
             "Approving lets the app's releaser roll production as often as needed inside this window without asking again: any release from a v* tag or ${DEFAULT_BRANCH} whose images CI built and attested." \
             "" \
-            "ASKED BY: ${REQUESTER}" \
-            "WHY:      ${REASON}" \
+            "ASKED BY:   ${REQUESTER}" \
+            "STARTED BY: @${GITHUB_ACTOR}" \
+            "WHY:        ${REASON}" \
             "Request run: ${RUN_URL}" | head -c 950)
           echo "Justification the approvers will see:"; echo "-----"; echo "$JUSTIFICATION"; echo "-----"
           { echo "### Deploy window requested"; echo '```'; echo "$JUSTIFICATION"; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
@@ -141,4 +140,4 @@ jobs:
             --justification="$JUSTIFICATION" --format='value(name)')
           echo "Window requested: $GRANT"
           echo "It needs its approvals before ${START}, or PAM drops it."
-          { echo; echo "Grant: \`$GRANT\` (approve in loopyloupe or the console before ${START})."; } >> "$GITHUB_STEP_SUMMARY"
+          { echo; echo "Grant: \`$GRANT\` (approve before ${START})."; } >> "$GITHUB_STEP_SUMMARY"
