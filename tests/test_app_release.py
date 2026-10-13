@@ -164,5 +164,147 @@ else:
         self.assertFalse(any(call[:3] == ['pam', 'grants', 'create'] for call in calls))
 
 
+
+def step_script(workflow, name):
+    step = workflow.read_text().split(f'      - name: {name}\n', 1)[1]
+    return textwrap.dedent(step.split('        run: |\n', 1)[1].split('\n      - ', 1)[0])
+
+
+class DeployWindowReleaseTest(unittest.TestCase):
+    """A release inside an approved deploy window neither asks nor waits."""
+
+    def run_gate(self, window_state=None, minutes_left=180, window_entitlement='deploy-window'):
+        script = step_script(WORKFLOW, 'Await PAM approval')
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            fake = root / 'gcloud'
+            fake.write_text('''#!/usr/bin/env python3
+import datetime, json, os, sys
+args = sys.argv[1:]
+with open(os.environ['CALLS'], 'a') as log:
+    log.write(json.dumps(args) + '\\n')
+if args[:3] == ['pam', 'grants', 'list'] and '--entitlement=deploy-window' in args:
+    if os.environ['WINDOW_STATE']:
+        print('window-grant ' + os.environ['WINDOW_STATE'])
+elif args[:3] == ['pam', 'grants', 'list']:
+    pass
+elif args[:4] == ['pam', 'grants', 'describe', 'window-grant']:
+    left = int(os.environ['MINUTES_LEFT'])
+    started = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(minutes=240 - left)
+    print(json.dumps({'requestedDuration': '14400s', 'state': 'ACTIVE',
+                      'timeline': {'events': [{'eventTime': started.strftime('%Y-%m-%dT%H:%M:%S.123456Z'), 'activated': {}}]}}))
+elif args[:3] == ['pam', 'grants', 'create']:
+    print('new-grant')
+elif args[:4] == ['pam', 'grants', 'describe', 'new-grant']:
+    print('ACTIVE')
+elif args[:2] == ['storage', 'cat']:
+    pass
+else:
+    print('unexpected gcloud call: ' + repr(args), file=sys.stderr)
+    sys.exit(99)
+''')
+            fake.chmod(0o755)
+            (root / 'git').write_text('#!/bin/sh\nprintf "replacement release\\n"\n')
+            (root / 'git').chmod(0o755)
+            (root / 'want.env').write_text('')
+            calls = root / 'calls'
+            environment = root / 'environment'
+            env = os.environ | {
+                'PATH': str(root) + os.pathsep + os.environ['PATH'],
+                'CALLS': str(calls), 'WINDOW_STATE': window_state or '', 'MINUTES_LEFT': str(minutes_left),
+                'ENTITLEMENT': 'app-deploy', 'WINDOW_ENTITLEMENT': window_entitlement, 'RUNTIME': 'bot-vm',
+                'CONFIG_FILE': '', 'CONFIG_BUCKET': 'bucket',
+                'RUNNER_TEMP': directory, 'GITHUB_STEP_SUMMARY': str(root / 'summary'),
+                'GITHUB_ENV': str(environment),
+                'GITHUB_SERVER_URL': 'https://github.com',
+                'GITHUB_REPOSITORY': 'org/app', 'GITHUB_RUN_ID': '123',
+                'GITHUB_ACTOR': 'operator', 'GITHUB_REF_NAME': 'main',
+                'CONFIG_REUSE': '', 'CONFIG_PREVIOUS': '', 'CONFIG_DIFFSTAT': '',
+                'SERVICE': '', 'PROJECT': 'production', 'IMAGES': '', 'VERSION': '',
+            }
+            result = subprocess.run(['bash', '-euo', 'pipefail', '-c', script],
+                                    env=env, text=True, capture_output=True)
+            recorded = [json.loads(line) for line in calls.read_text().splitlines()] if calls.exists() else []
+            exported = environment.read_text() if environment.exists() else ''
+            return result, recorded, exported
+
+    def test_active_window_skips_the_approval(self):
+        result, calls, exported = self.run_gate('ACTIVE')
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn('Inside an approved deploy window', result.stdout)
+        self.assertFalse(any(call[:3] == ['pam', 'grants', 'create'] for call in calls))
+        self.assertNotIn('PAM_GRANT=', exported)
+
+    def test_window_ending_soon_asks_as_usual(self):
+        result, calls, exported = self.run_gate('ACTIVE', minutes_left=5)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn('under 15 minutes', result.stdout)
+        self.assertTrue(any(call[:3] == ['pam', 'grants', 'create'] for call in calls))
+        self.assertIn('PAM_GRANT=new-grant', exported)
+
+    def test_scheduled_window_is_not_open_yet(self):
+        result, calls, exported = self.run_gate('SCHEDULED')
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertTrue(any(call[:3] == ['pam', 'grants', 'create'] for call in calls))
+        self.assertIn('PAM_GRANT=new-grant', exported)
+
+    def test_no_window_entitlement_keeps_the_old_flow(self):
+        result, calls, exported = self.run_gate('ACTIVE', window_entitlement='')
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertFalse(any('--entitlement=deploy-window' in call for call in calls))
+        self.assertIn('PAM_GRANT=new-grant', exported)
+
+
+DEPLOY_WINDOW = Path(__file__).resolve().parents[1] / '.github/workflows/deploy-window.yml'
+
+
+class DeployWindowRequestTest(unittest.TestCase):
+    """The request side refuses what PAM would refuse, before asking it."""
+
+    def check(self, start_in_minutes=60 * 24, hours='4', ref='refs/heads/main', start=None):
+        import datetime
+        script = step_script(DEPLOY_WINDOW, 'Check the window')
+        when = start or (datetime.datetime.now(datetime.timezone.utc)
+                         + datetime.timedelta(minutes=start_in_minutes)).strftime('%Y-%m-%dT%H:%M:%SZ')
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            output = root / 'output'
+            env = os.environ | {
+                'PROJECT': 'production', 'ENTITLEMENT': 'deploy-window',
+                'START_IN': when, 'HOURS_IN': hours,
+                'REQUESTER_IN': 'kais@t0trade.com', 'REASON_IN': 'Thursday release, approvers away',
+                'DEFAULT_BRANCH': 'main', 'GITHUB_REF': ref,
+                'GITHUB_SERVER_URL': 'https://github.com', 'GITHUB_REPOSITORY': 'org/app', 'GITHUB_RUN_ID': '9',
+                'GITHUB_OUTPUT': str(output), 'GITHUB_STEP_SUMMARY': str(root / 'summary'),
+            }
+            result = subprocess.run(['bash', '-euo', 'pipefail', '-c', script],
+                                    env=env, text=True, capture_output=True)
+            return result, output.read_text() if output.exists() else ''
+
+    def test_good_request_names_the_window_and_the_asker(self):
+        result, output = self.check()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn('seconds=14400', output)
+        self.assertIn('ASKED BY: kais@t0trade.com', output)
+        self.assertIn('Istanbul', output)
+
+    def test_refused_requests(self):
+        cases = {
+            'past': dict(start_in_minutes=-10),
+            'too soon': dict(start_in_minutes=2),
+            'beyond a week': dict(start_in_minutes=8 * 24 * 60),
+            'zero hours': dict(hours='0'),
+            'too long': dict(hours='13'),
+            'not a number': dict(hours='4h'),
+            'not UTC': dict(start='2026-10-22T16:00:00+03:00'),
+            'other branch': dict(ref='refs/heads/feature'),
+        }
+        for label, kwargs in cases.items():
+            with self.subTest(label):
+                result, output = self.check(**kwargs)
+                self.assertNotEqual(result.returncode, 0, label)
+                self.assertNotIn('seconds=', output)
+
+
 if __name__ == '__main__':
     unittest.main()

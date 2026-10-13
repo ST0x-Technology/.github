@@ -85,6 +85,11 @@ on:
         required: false
         type: string
         default: ""
+      window_entitlement:
+        description: "PAM entitlement id of the plane's pre-approved deploy window (deploy-window.yml); an ACTIVE grant there replaces the approval step. Empty = no windows."
+        required: false
+        type: string
+        default: deploy-window
       image_tag:
         description: >-
           Artifact Registry tag naming the digests to deploy: vX.Y.Z (a
@@ -155,6 +160,7 @@ jobs:
       IMAGES: ${{ inputs.images }}
       ATTESTOR: ${{ inputs.attestor }}
       ENTITLEMENT: ${{ inputs.pam_entitlement }}
+      WINDOW_ENTITLEMENT: ${{ inputs.window_entitlement }}
       IMAGE_TAG_INPUT: ${{ inputs.image_tag }}
       CONFIG_FILE: ${{ inputs.config_file }}
       CONFIG_SECRET: ${{ inputs.config_secret }}
@@ -404,6 +410,33 @@ jobs:
         run: |
           set -euo pipefail
           ascii() { LC_ALL=C sed -e 's/\xe2\x80\x94/-/g' -e 's/\xe2\x80\x93/-/g' -e 's/\xe2\x86\x92/->/g' | LC_ALL=C tr -cd '\11\12\15\40-\176'; }
+
+          # A deploy window approved ahead of time (deploy-window.yml) is an
+          # ACTIVE grant on its own entitlement: the releaser already holds
+          # the deploy role, so the run neither asks nor waits, and leaves
+          # PAM_GRANT unset so the revoke step below never closes the window.
+          # With under 15 minutes left the roll might outlive the window, so
+          # it asks for a one-off approval as usual instead.
+          if [ -n "${WINDOW_ENTITLEMENT:-}" ]; then
+            WINDOW=$(gcloud pam grants list --entitlement="$WINDOW_ENTITLEMENT" --location=global \
+              --format='value(name,state)' 2>/dev/null \
+              | awk '$2 == "ACTIVE" {print $1; exit}') || true
+            if [ -n "$WINDOW" ]; then
+              WINDOW_END=$(gcloud pam grants describe "$WINDOW" --format=json | jq -r '
+                ([.timeline.events[]? | select(.activated) | .eventTime][0]) as $at
+                | if $at == null then empty else
+                    ($at | sub("\\.[0-9]+Z$"; "Z") | fromdateiso8601)
+                    + (.requestedDuration | rtrimstr("s") | tonumber | floor) end') || WINDOW_END=""
+              LEFT=$(( ${WINDOW_END:-0} - $(date -u +%s) ))
+              if [ -n "$WINDOW_END" ] && [ "$LEFT" -ge 900 ]; then
+                echo "Inside an approved deploy window, $((LEFT / 60)) min left: $WINDOW"
+                { echo "### Deploy window"; echo "Rolled inside the approved window \`$WINDOW\` ($((LEFT / 60)) min left); no new approval was asked."; } >> "$GITHUB_STEP_SUMMARY"
+                exit 0
+              fi
+              echo "::notice::the deploy window $WINDOW ends in under 15 minutes; asking for a one-off approval instead."
+            fi
+          fi
+
           GRANT=$(gcloud pam grants list --entitlement="$ENTITLEMENT" --location=global \
             --format='value(name,state)' 2>/dev/null \
             | awk '$2 == "ACTIVE" || $2 == "APPROVAL_AWAITED" || $2 == "ACTIVATING" {print $1; exit}') || true
@@ -571,10 +604,12 @@ jobs:
         run: |
           set -euo pipefail
           [ -n "${PAM_GRANT:-}" ] || exit 0
-          # Revoking needs privilegedaccessmanager.grants.revoke, which the
-          # releaser does not hold (maker-recovery learned the same); the
-          # grant self-expires within the hour, and the reuse rule above
-          # never lets another release ride it, so a failed revoke is a
+          # PAM_GRANT is the one-off app-deploy grant this run asked for or
+          # reused; a deploy window never sets it, so a window stays open
+          # for the next release. Revoking needs privilegedaccessmanager.
+          # grants.revoke (the gate module's appReleaseGrantRevoker role);
+          # without it the grant self-expires within the hour and any
+          # release in that hour may reuse it, so a failed revoke is a
           # warning, not a red deploy.
           if gcloud pam grants revoke "$PAM_GRANT" --reason="deploy succeeded: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}" >/dev/null 2>&1; then
             echo "Grant revoked: $PAM_GRANT"
