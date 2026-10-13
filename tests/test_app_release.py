@@ -321,7 +321,7 @@ DEPLOY_WINDOW = Path(__file__).resolve().parents[1] / '.github/workflows/deploy-
 class DeployWindowRequestTest(unittest.TestCase):
     """The request side refuses what PAM would refuse, before asking it."""
 
-    def check(self, start_in_minutes=60 * 24, hours='4', ref='refs/heads/main', start=None):
+    def check(self, start_in_minutes=60 * 24, hours='4', ref='refs/heads/main', start=None, entitlement='deploy-window'):
         import datetime
         script = step_script(DEPLOY_WINDOW, 'Check the window')
         when = start or (datetime.datetime.now(datetime.timezone.utc)
@@ -330,7 +330,7 @@ class DeployWindowRequestTest(unittest.TestCase):
             root = Path(directory)
             output = root / 'output'
             env = os.environ | {
-                'PROJECT': 'production', 'ENTITLEMENT': 'deploy-window',
+                'PROJECT': 'production', 'ENTITLEMENT': entitlement,
                 'START_IN': when, 'HOURS_IN': hours,
                 'REQUESTER_IN': 'operator', 'REASON_IN': 'Thursday release, approvers away',
                 'DEFAULT_BRANCH': 'main', 'GITHUB_REF': ref, 'GITHUB_ACTOR': 'operator',
@@ -358,6 +358,7 @@ class DeployWindowRequestTest(unittest.TestCase):
             'not a number': dict(hours='4h'),
             'not UTC': dict(start='2026-10-22T16:00:00+03:00'),
             'other branch': dict(ref='refs/heads/feature'),
+            'one-off entitlement': dict(entitlement='app-deploy'),
         }
         for label, kwargs in cases.items():
             with self.subTest(label):
