@@ -268,7 +268,8 @@ else:
                      dict(github_ref='refs/tags/v1.2.0', ref=COMMIT),
                      dict(ref='main'),
                      dict(image_tag='v1.2.0'),
-                     dict(ref='refs/tags/v1.1.0', image_tag='v1.1.0', head='d' * 40, tag_commit='d' * 40)):
+                     dict(ref='refs/tags/v1.1.0', image_tag='v1.1.0', head='d' * 40, tag_commit='d' * 40),
+                     dict(ref='v1.1.0', image_tag='v1.1.0', head='d' * 40, tag_commit='d' * 40)):
             with self.subTest(**case):
                 self.assert_skipped(*self.run_gate([('ACTIVE', 180)], **case))
 

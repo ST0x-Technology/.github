@@ -435,10 +435,17 @@ jobs:
             refs/tags/v[0-9]*|"refs/heads/${DEFAULT_BRANCH:-}")
               [ -n "$HEAD_COMMIT" ] && [ "$HEAD_COMMIT" = "${GITHUB_SHA:-}" ] && IN_WINDOW_SCOPE=true ;;
           esac
+          # A rollback names its tag in full (refs/tags/v1.2.0) or short
+          # (v1.2.0); the short form is looked up under refs/tags/ only, so
+          # a branch named like a version never counts.
+          TAG_REF=""
           case "${REF_INPUT:-}" in
-            refs/tags/v[0-9]*)
-              [ -n "$HEAD_COMMIT" ] && [ "$HEAD_COMMIT" = "$(git rev-parse -q --verify "${REF_INPUT}^{commit}" 2>/dev/null || true)" ] && IN_WINDOW_SCOPE=true ;;
+            refs/tags/v[0-9]*) TAG_REF="$REF_INPUT" ;;
+            v[0-9]*) TAG_REF="refs/tags/${REF_INPUT}" ;;
           esac
+          if [ -n "$TAG_REF" ] && [ -n "$HEAD_COMMIT" ] && [ "$HEAD_COMMIT" = "$(git rev-parse -q --verify "${TAG_REF}^{commit}" 2>/dev/null || true)" ]; then
+            IN_WINDOW_SCOPE=true
+          fi
           case "${IMAGE_TAG_INPUT:-}" in ''|v[0-9]*) ;; *) IN_WINDOW_SCOPE=false ;; esac
           if [ -n "${WINDOW_ENTITLEMENT:-}" ] && ! $IN_WINDOW_SCOPE; then
             echo "::notice::${GITHUB_REF:-} with ref '${REF_INPUT:-}' / image_tag '${IMAGE_TAG_INPUT:-}' is outside what a deploy window covers; asking for a one-off approval."

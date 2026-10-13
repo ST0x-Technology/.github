@@ -102,7 +102,7 @@ jobs:
           JUSTIFICATION=$(printf '%s\n' \
             "PRODUCTION DEPLOY WINDOW for ${GITHUB_REPOSITORY} in ${PROJECT}." \
             "From $(fmt UTC "$START") to $(fmt UTC "$END") UTC ($(fmt Europe/Istanbul "$START") to $(fmt Europe/Istanbul "$END") Istanbul), ${HOURS} h." \
-            "Approving lets the app's releaser roll production as often as needed inside this window without asking again: any release from a v* tag or ${DEFAULT_BRANCH} whose images CI built and attested." \
+            "Approving gives the app's releaser its deploy role for the whole window, so it can roll production as often as needed without asking again. The shared release workflow uses it only for a release from a v* tag or ${DEFAULT_BRANCH} whose images CI built and attested; PAM itself enforces the role and the hours, not that rule." \
             "" \
             "ASKED BY: ${REQUESTER}" \
             "WHY:      ${REASON}" \
