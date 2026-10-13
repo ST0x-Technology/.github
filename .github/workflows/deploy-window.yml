@@ -91,7 +91,7 @@ jobs:
           fi
           END=$((START + HOURS * 3600))
           # Who asked = who started the run: GitHub's own record of the person
-          # whose sign-in dispatched it (from loopyloupe or the Actions tab).
+          # whose sign-in dispatched it (from the team's tooling or the Actions tab).
           REQUESTER=$(printf '%s' "$REQUESTER_IN" | ascii | cut -c1-120)
           [ -n "$REQUESTER" ] && REQUESTER="@${REQUESTER#@}"
           REASON=$(printf '%s' "$REASON_IN" | ascii | cut -c1-300)
