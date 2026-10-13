@@ -5,16 +5,20 @@ name: deploy-window
 # `start` and lasts `hours`. Two approvers approve it any time before the
 # start (PAM drops a request still waiting at its start time). While the
 # window is open, every production release of the app (app-release.yml)
-# finds the grant ACTIVE and rolls without asking again. Nothing else is
-# relaxed: only the default branch or a v* tag can act as the releaser,
-# every digest must carry the app's attestation, and the roll itself is the
-# same as with a one-off approval.
+# finds the grant ACTIVE and rolls without asking again. What PAM enforces
+# is the role and the hours: for the whole window the releaser holds the
+# plane's deploy role, so any job that can act as it (one on the default
+# branch or a v* tag) could use it. The attestation check and the rule that
+# a window covers only a release from a v* tag or the default branch, both
+# merged, live in app-release.yml, not in IAM.
 #
 # A caller in the app repo starts this (workflow_dispatch on the default
-# branch) for the person who asked, who is named in the justification.
+# branch), run by the person who asked with their own GitHub sign-in, so
+# GitHub records them as the actor and the justification names them.
 #
-# Callers pass the plane's identity facts and the four request fields, with
-# job-level permissions id-token: write + contents: read, pinned by SHA.
+# Callers pass the plane's identity facts and the three request fields,
+# with job-level permissions id-token: write + contents: read, pinned by
+# SHA.
 on:
   workflow_call:
     inputs:

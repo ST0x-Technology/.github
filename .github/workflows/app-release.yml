@@ -446,6 +446,17 @@ jobs:
           if [ -n "$TAG_REF" ] && [ -n "$HEAD_COMMIT" ] && [ "$HEAD_COMMIT" = "$(git rev-parse -q --verify "${TAG_REF}^{commit}" 2>/dev/null || true)" ]; then
             IN_WINDOW_SCOPE=true
           fi
+          # Merged code only: a v* tag pushed at a commit that never reached
+          # the default branch is outside the window (a shallow fetch of the
+          # default branch is enough for recent commits; an older one just
+          # asks for a one-off approval).
+          if $IN_WINDOW_SCOPE && [ -n "${DEFAULT_BRANCH:-}" ]; then
+            if ! git fetch -q --depth=500 origin "$DEFAULT_BRANCH" 2>/dev/null \
+               || ! git merge-base --is-ancestor "$HEAD_COMMIT" "origin/${DEFAULT_BRANCH}" 2>/dev/null; then
+              echo "::notice::${HEAD_COMMIT} is not on ${DEFAULT_BRANCH}; outside what a deploy window covers."
+              IN_WINDOW_SCOPE=false
+            fi
+          fi
           case "${IMAGE_TAG_INPUT:-}" in ''|v[0-9]*) ;; *) IN_WINDOW_SCOPE=false ;; esac
           if [ -n "${WINDOW_ENTITLEMENT:-}" ] && ! $IN_WINDOW_SCOPE; then
             echo "::notice::${GITHUB_REF:-} with ref '${REF_INPUT:-}' / image_tag '${IMAGE_TAG_INPUT:-}' is outside what a deploy window covers; asking for a one-off approval."

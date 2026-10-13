@@ -171,7 +171,7 @@ class DeployWindowReleaseTest(unittest.TestCase):
     """A release inside an approved deploy window neither asks nor waits."""
 
     def run_gate(self, windows=(), list_error='', window_entitlement='deploy-window', ref='', image_tag='',
-                 github_ref='refs/heads/main', head=COMMIT, tag_commit=''):
+                 github_ref='refs/heads/main', head=COMMIT, tag_commit='', merged=True):
         script = step_script(WORKFLOW, 'Await PAM approval')
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -209,7 +209,9 @@ else:
             fake.chmod(0o755)
             (root / 'git').write_text('#!/bin/sh\n'
                                       'case "$*" in "rev-parse HEAD") exec printf "%s\\n" "$HEAD_SHA" ;;\n'
-                                      '  "rev-parse -q --verify refs/tags/"*) exec printf "%s\\n" "$TAG_SHA" ;; esac\n'
+                                      '  "rev-parse -q --verify refs/tags/"*) exec printf "%s\\n" "$TAG_SHA" ;;\n'
+                                      '  "fetch -q --depth=500 origin main") exit 0 ;;\n'
+                                      '  "merge-base --is-ancestor "*) exit "$NOT_MERGED" ;; esac\n'
                                       'printf "replacement release\\n"\n')
             (root / 'git').chmod(0o755)
             (root / 'want.env').write_text('')
@@ -221,6 +223,7 @@ else:
                 'ENTITLEMENT': 'app-deploy', 'WINDOW_ENTITLEMENT': window_entitlement, 'RUNTIME': 'bot-vm',
                 'REF_INPUT': ref, 'IMAGE_TAG_INPUT': image_tag, 'DEFAULT_BRANCH': 'main',
                 'GITHUB_REF': github_ref, 'GITHUB_SHA': COMMIT, 'HEAD_SHA': head, 'TAG_SHA': tag_commit,
+                'NOT_MERGED': '0' if merged else '1',
                 'CONFIG_FILE': '', 'CONFIG_BUCKET': 'bucket',
                 'RUNNER_TEMP': directory, 'GITHUB_STEP_SUMMARY': str(root / 'summary'),
                 'GITHUB_ENV': str(environment),
@@ -277,6 +280,8 @@ else:
         for case in (dict(github_ref='refs/heads/feature'),
                      dict(ref='v1-feature', head='b' * 40),
                      dict(ref='refs/tags/v1.1.0', head='b' * 40, tag_commit='d' * 40),
+                     dict(github_ref='refs/tags/v1.2.0', merged=False),
+                     dict(ref='v1.1.0', image_tag='v1.1.0', head='d' * 40, tag_commit='d' * 40, merged=False),
                      dict(image_tag='c' * 40)):
             with self.subTest(**case):
                 result, calls, exported = self.run_gate([('ACTIVE', 180)], **case)
