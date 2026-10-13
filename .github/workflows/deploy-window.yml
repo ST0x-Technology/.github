@@ -44,10 +44,6 @@ on:
         description: "Window length in whole hours (1 to 12, and no longer than the entitlement allows)."
         required: true
         type: string
-      requester:
-        description: "Who asked for the window (their email)."
-        required: true
-        type: string
       reason:
         description: "Why the window is needed, in one line."
         required: true
@@ -61,7 +57,7 @@ jobs:
       ENTITLEMENT: ${{ inputs.entitlement }}
       START_IN: ${{ inputs.start }}
       HOURS_IN: ${{ inputs.hours }}
-      REQUESTER_IN: ${{ inputs.requester }}
+      REQUESTER_IN: ${{ github.triggering_actor }}
       REASON_IN: ${{ inputs.reason }}
       DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
       CLOUDSDK_CORE_PROJECT: ${{ inputs.project }}
@@ -94,9 +90,12 @@ jobs:
             echo "::error::PAM schedules at most 7 days ahead; ask again within a week of the window."; exit 1
           fi
           END=$((START + HOURS * 3600))
+          # Who asked = who started the run: GitHub's own record of the person
+          # whose sign-in dispatched it (from loopyloupe or the Actions tab).
           REQUESTER=$(printf '%s' "$REQUESTER_IN" | ascii | cut -c1-120)
+          [ -n "$REQUESTER" ] && REQUESTER="@${REQUESTER#@}"
           REASON=$(printf '%s' "$REASON_IN" | ascii | cut -c1-300)
-          [ -n "$REQUESTER" ] || { echo "::error::requester is empty."; exit 1; }
+          [ -n "$REQUESTER" ] || { echo "::error::GitHub did not say who started this run."; exit 1; }
           [ -n "$REASON" ] || { echo "::error::reason is empty."; exit 1; }
           fmt() { TZ="$1" date -d "@$2" "+%a %d %b %H:%M"; }
           RUN_URL="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
@@ -105,9 +104,8 @@ jobs:
             "From $(fmt UTC "$START") to $(fmt UTC "$END") UTC ($(fmt Europe/Istanbul "$START") to $(fmt Europe/Istanbul "$END") Istanbul), ${HOURS} h." \
             "Approving lets the app's releaser roll production as often as needed inside this window without asking again: any release from a v* tag or ${DEFAULT_BRANCH} whose images CI built and attested." \
             "" \
-            "ASKED BY:   ${REQUESTER}" \
-            "STARTED BY: @${GITHUB_ACTOR}" \
-            "WHY:        ${REASON}" \
+            "ASKED BY: ${REQUESTER}" \
+            "WHY:      ${REASON}" \
             "Request run: ${RUN_URL}" | head -c 950)
           echo "Justification the approvers will see:"; echo "-----"; echo "$JUSTIFICATION"; echo "-----"
           { echo "### Deploy window requested"; echo '```'; echo "$JUSTIFICATION"; echo '```'; } >> "$GITHUB_STEP_SUMMARY"

@@ -326,7 +326,7 @@ class DeployWindowRequestTest(unittest.TestCase):
             env = os.environ | {
                 'PROJECT': 'production', 'ENTITLEMENT': 'deploy-window',
                 'START_IN': when, 'HOURS_IN': hours,
-                'REQUESTER_IN': 'requester@example.com', 'REASON_IN': 'Thursday release, approvers away',
+                'REQUESTER_IN': 'operator', 'REASON_IN': 'Thursday release, approvers away',
                 'DEFAULT_BRANCH': 'main', 'GITHUB_REF': ref, 'GITHUB_ACTOR': 'operator',
                 'GITHUB_SERVER_URL': 'https://github.com', 'GITHUB_REPOSITORY': 'org/app', 'GITHUB_RUN_ID': '9',
                 'GITHUB_OUTPUT': str(output), 'GITHUB_STEP_SUMMARY': str(root / 'summary'),
@@ -339,8 +339,7 @@ class DeployWindowRequestTest(unittest.TestCase):
         result, output = self.check()
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertIn('seconds=14400', output)
-        self.assertIn('ASKED BY:   requester@example.com', output)
-        self.assertIn('STARTED BY: @operator', output)
+        self.assertIn('ASKED BY: @operator', output)
         self.assertIn('Istanbul', output)
 
     def test_refused_requests(self):
