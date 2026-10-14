@@ -14,7 +14,10 @@ name: app-release
 #                workflow as the app's <app>-releaser: same steps, but the
 #                roll waits for an approved `app-deploy` PAM grant in the
 #                env project. The identity holds NO deploy role at rest
-#                (t0.devops modules/app-releaser + app-release-gate).
+#                (t0.devops modules/app-releaser + app-release-gate),
+#                except inside a deploy window approved ahead of time
+#                (deploy-window.yml): then a release rolls with no new
+#                approval and no revoke.
 #
 # What is verified before anyone is asked to approve:
 #   - every digest about to run exists in the registry and carries the
@@ -85,6 +88,11 @@ on:
         required: false
         type: string
         default: ""
+      window_entitlement:
+        description: "PAM entitlement id of the plane's pre-approved deploy window (deploy-window.yml); an ACTIVE grant there replaces the approval step. Empty = no windows."
+        required: false
+        type: string
+        default: deploy-window
       image_tag:
         description: >-
           Artifact Registry tag naming the digests to deploy: vX.Y.Z (a
@@ -155,7 +163,10 @@ jobs:
       IMAGES: ${{ inputs.images }}
       ATTESTOR: ${{ inputs.attestor }}
       ENTITLEMENT: ${{ inputs.pam_entitlement }}
+      WINDOW_ENTITLEMENT: ${{ inputs.window_entitlement }}
       IMAGE_TAG_INPUT: ${{ inputs.image_tag }}
+      REF_INPUT: ${{ inputs.ref }}
+      DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
       CONFIG_FILE: ${{ inputs.config_file }}
       CONFIG_SECRET: ${{ inputs.config_secret }}
       CONFIG_MOUNT: ${{ inputs.config_mount }}
@@ -404,6 +415,75 @@ jobs:
         run: |
           set -euo pipefail
           ascii() { LC_ALL=C sed -e 's/\xe2\x80\x94/-/g' -e 's/\xe2\x80\x93/-/g' -e 's/\xe2\x86\x92/->/g' | LC_ALL=C tr -cd '\11\12\15\40-\176'; }
+
+          # A deploy window approved ahead of time (deploy-window.yml) is an
+          # ACTIVE grant on its own entitlement: the releaser already holds
+          # the deploy role, so the run neither asks nor waits, and leaves
+          # PAM_GRANT unset so the revoke step below never closes the window.
+          # A bot-vm roll can take 5 minutes to write images.env and 15 more
+          # to see it adopted, so with under 30 minutes left in every open
+          # window it asks for a one-off approval as usual instead. A window
+          # covers what its approvers were told: a run on a v* tag or the
+          # default branch that releases that run's own commit, or a
+          # rollback that checked out a refs/tags/v* ref.
+          if [ -n "${WINDOW_ENTITLEMENT:-}" ] && [ "${WINDOW_ENTITLEMENT##*/}" = "${ENTITLEMENT##*/}" ]; then
+            echo "::error::window_entitlement and pam_entitlement are both ${ENTITLEMENT##*/}; a deploy window needs its own entitlement."; exit 1
+          fi
+          IN_WINDOW_SCOPE=false
+          HEAD_COMMIT=$(git rev-parse HEAD 2>/dev/null || true)
+          case "${GITHUB_REF:-}" in
+            refs/tags/v[0-9]*|"refs/heads/${DEFAULT_BRANCH:-}")
+              [ -n "$HEAD_COMMIT" ] && [ "$HEAD_COMMIT" = "${GITHUB_SHA:-}" ] && IN_WINDOW_SCOPE=true ;;
+          esac
+          # A rollback names its tag in full (refs/tags/v1.2.0) or short
+          # (v1.2.0); the short form is looked up under refs/tags/ only, so
+          # a branch named like a version never counts.
+          TAG_REF=""
+          case "${REF_INPUT:-}" in
+            refs/tags/v[0-9]*) TAG_REF="$REF_INPUT" ;;
+            v[0-9]*) TAG_REF="refs/tags/${REF_INPUT}" ;;
+          esac
+          if [ -n "$TAG_REF" ] && [ -n "$HEAD_COMMIT" ] && [ "$HEAD_COMMIT" = "$(git rev-parse -q --verify "${TAG_REF}^{commit}" 2>/dev/null || true)" ]; then
+            IN_WINDOW_SCOPE=true
+          fi
+          # Merged code only: a v* tag pushed at a commit that never reached
+          # the default branch is outside the window (a shallow fetch of the
+          # default branch is enough for recent commits; an older one just
+          # asks for a one-off approval).
+          if $IN_WINDOW_SCOPE && [ -n "${DEFAULT_BRANCH:-}" ]; then
+            if ! git fetch -q --depth=500 origin "$DEFAULT_BRANCH" 2>/dev/null \
+               || ! git merge-base --is-ancestor "$HEAD_COMMIT" "origin/${DEFAULT_BRANCH}" 2>/dev/null; then
+              echo "::notice::${HEAD_COMMIT} is not on ${DEFAULT_BRANCH}; outside what a deploy window covers."
+              IN_WINDOW_SCOPE=false
+            fi
+          fi
+          case "${IMAGE_TAG_INPUT:-}" in ''|v[0-9]*) ;; *) IN_WINDOW_SCOPE=false ;; esac
+          if [ -n "${WINDOW_ENTITLEMENT:-}" ] && ! $IN_WINDOW_SCOPE; then
+            echo "::notice::${GITHUB_REF:-} with ref '${REF_INPUT:-}' / image_tag '${IMAGE_TAG_INPUT:-}' is outside what a deploy window covers; asking for a one-off approval."
+          elif [ -n "${WINDOW_ENTITLEMENT:-}" ]; then
+            if WINDOWS=$(gcloud pam grants list --entitlement="$WINDOW_ENTITLEMENT" --location=global \
+                --format=json 2>"$RUNNER_TEMP/window.err"); then
+              read -r WINDOW WINDOW_END < <(jq -r '
+                [.[] | select(.state == "ACTIVE")
+                  | ([.timeline.events[]? | select(.activated) | .eventTime][0]) as $at
+                  | select($at != null)
+                  | {name, end: (($at | sub("\\.[0-9]+Z$"; "Z") | fromdateiso8601)
+                      + (.requestedDuration | rtrimstr("s") | tonumber | floor))}]
+                | max_by(.end) // empty | "\(.name) \(.end)"' <<<"$WINDOWS") || true
+              if [ -n "${WINDOW:-}" ]; then
+                LEFT=$(( WINDOW_END - $(date -u +%s) ))
+                if [ "$LEFT" -ge 1800 ]; then
+                  echo "Inside an approved deploy window, $((LEFT / 60)) min left: $WINDOW"
+                  { echo "### Deploy window"; echo "Rolled inside the approved window \`$WINDOW\` ($((LEFT / 60)) min left); no new approval was asked."; } >> "$GITHUB_STEP_SUMMARY"
+                  exit 0
+                fi
+                echo "::notice::the deploy window $WINDOW ends in under 30 minutes; asking for a one-off approval instead."
+              fi
+            elif ! grep -q NOT_FOUND "$RUNNER_TEMP/window.err"; then
+              echo "::warning::could not list deploy windows on ${WINDOW_ENTITLEMENT}; asking for a one-off approval instead: $(head -c 300 "$RUNNER_TEMP/window.err")"
+            fi
+          fi
+
           GRANT=$(gcloud pam grants list --entitlement="$ENTITLEMENT" --location=global \
             --format='value(name,state)' 2>/dev/null \
             | awk '$2 == "ACTIVE" || $2 == "APPROVAL_AWAITED" || $2 == "ACTIVATING" {print $1; exit}') || true
@@ -571,10 +651,11 @@ jobs:
         run: |
           set -euo pipefail
           [ -n "${PAM_GRANT:-}" ] || exit 0
-          # Revoking needs privilegedaccessmanager.grants.revoke, which the
-          # releaser does not hold (maker-recovery learned the same); the
-          # grant self-expires within the hour, and the reuse rule above
-          # never lets another release ride it, so a failed revoke is a
+          # PAM_GRANT is the one-off app-deploy grant this run asked for or
+          # reused; a deploy window never sets it, so a window stays open
+          # for the next release. Revoking needs privilegedaccessmanager.
+          # grants.revoke; without it the grant self-expires within the hour and any
+          # release in that hour may reuse it, so a failed revoke is a
           # warning, not a red deploy.
           if gcloud pam grants revoke "$PAM_GRANT" --reason="deploy succeeded: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}" >/dev/null 2>&1; then
             echo "Grant revoked: $PAM_GRANT"

@@ -1,0 +1,152 @@
+name: deploy-window
+# A production deploy window, approved ahead of time.
+#
+# The app's releaser asks PAM for a `deploy-window` grant that starts at
+# `start` and lasts `hours`. Two approvers approve it any time before the
+# start (PAM drops a request still waiting at its start time). While the
+# window is open with at least 30 minutes left, every production release
+# of the app (app-release.yml) finds the grant ACTIVE and rolls without
+# asking again; nearer the end it asks for a one-off approval. What PAM enforces
+# is the role and the hours: for the whole window the releaser holds the
+# plane's deploy role, so any job that can act as it (one on the default
+# branch or a v* tag) could use it. The attestation check and the rule that
+# a window covers only a release from a v* tag or the default branch, both
+# merged, live in app-release.yml, not in IAM.
+#
+# A caller in the app repo starts this (workflow_dispatch on the default
+# branch), run by the person who asked with their own GitHub sign-in, so
+# GitHub records them as the actor and the justification names them.
+#
+# Callers pass the plane's identity facts and the three request fields,
+# with job-level permissions id-token: write + contents: read, pinned by
+# SHA.
+on:
+  workflow_call:
+    inputs:
+      project:
+        description: "The env GCP project id."
+        required: true
+        type: string
+      service_account:
+        description: "The app's <app>-releaser."
+        required: true
+        type: string
+      wif_provider:
+        description: "Workload Identity provider (defaults to the t0-artifacts hub)."
+        required: false
+        type: string
+        default: projects/684788085322/locations/global/workloadIdentityPools/github-actions/providers/github-oidc
+      entitlement:
+        description: "PAM entitlement id of the window in the env project."
+        required: false
+        type: string
+        default: deploy-window
+      start:
+        description: "Window start in UTC, RFC 3339 (2026-10-22T13:00:00Z). At most 7 days ahead."
+        required: true
+        type: string
+      hours:
+        description: "Window length in whole hours (1 to 12, and no longer than the entitlement allows)."
+        required: true
+        type: string
+      reason:
+        description: "Why the window is needed, in one line."
+        required: true
+        type: string
+
+jobs:
+  request:
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: read
+    env:
+      PROJECT: ${{ inputs.project }}
+      ENTITLEMENT: ${{ inputs.entitlement }}
+      START_IN: ${{ inputs.start }}
+      HOURS_IN: ${{ inputs.hours }}
+      REQUESTER_IN: ${{ github.triggering_actor }}
+      REASON_IN: ${{ inputs.reason }}
+      DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+      CLOUDSDK_CORE_PROJECT: ${{ inputs.project }}
+    steps:
+      - name: Check the window
+        id: window
+        run: |
+          set -euo pipefail
+          ascii() { LC_ALL=C tr -cd '\40-\176'; }
+          if [ "${GITHUB_REF}" != "refs/heads/${DEFAULT_BRANCH}" ]; then
+            echo "::error::a deploy window is requested from ${DEFAULT_BRANCH} only (this run is on ${GITHUB_REF})."; exit 1
+          fi
+          case "${ENTITLEMENT##*/}" in
+            app-deploy|''|*[!a-z0-9-]*) echo "::error::a window needs its own entitlement, never app-deploy (got '${ENTITLEMENT}')."; exit 1 ;;
+          esac
+          case "$START_IN" in
+            [0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9]Z) ;;
+            *) echo "::error::start must be UTC in RFC 3339, like 2026-10-22T13:00:00Z (got '${START_IN}')."; exit 1 ;;
+          esac
+          case "$HOURS_IN" in
+            ''|*[!0-9]*) echo "::error::hours must be a whole number (got '${HOURS_IN}')."; exit 1 ;;
+          esac
+          HOURS=$((10#$HOURS_IN))
+          if [ "$HOURS" -lt 1 ] || [ "$HOURS" -gt 12 ]; then
+            echo "::error::a window lasts 1 to 12 hours (got ${HOURS})."; exit 1
+          fi
+          START=$(date -u -d "$START_IN" +%s) || { echo "::error::start '${START_IN}' is not a date."; exit 1; }
+          NOW=$(date -u +%s)
+          if [ "$START" -lt $((NOW + 300)) ]; then
+            echo "::error::the window must start at least 5 minutes from now; approvals have to land before it starts."; exit 1
+          fi
+          if [ "$START" -gt $((NOW + 7 * 86400)) ]; then
+            echo "::error::PAM schedules at most 7 days ahead; ask again within a week of the window."; exit 1
+          fi
+          END=$((START + HOURS * 3600))
+          # Who asked = who started the run: GitHub's own record of the person
+          # whose sign-in dispatched it (from the team's tooling or the Actions tab).
+          REQUESTER=$(printf '%s' "$REQUESTER_IN" | ascii | cut -c1-120)
+          [ -n "$REQUESTER" ] && REQUESTER="@${REQUESTER#@}"
+          REASON=$(printf '%s' "$REASON_IN" | ascii | cut -c1-300)
+          [ -n "$REQUESTER" ] || { echo "::error::GitHub did not say who started this run."; exit 1; }
+          [ -n "$REASON" ] || { echo "::error::reason is empty."; exit 1; }
+          fmt() { TZ="$1" date -d "@$2" "+%a %d %b %H:%M"; }
+          RUN_URL="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+          JUSTIFICATION=$(printf '%s\n' \
+            "PRODUCTION DEPLOY WINDOW for ${GITHUB_REPOSITORY} in ${PROJECT}." \
+            "From $(fmt UTC "$START") to $(fmt UTC "$END") UTC ($(fmt Europe/Istanbul "$START") to $(fmt Europe/Istanbul "$END") Istanbul), ${HOURS} h." \
+            "Approving gives the app's releaser its deploy role for the whole window, so it can roll production as often as needed without asking again. The shared release workflow uses it only for a release from a v* tag or ${DEFAULT_BRANCH} whose images CI built and attested; PAM itself enforces the role and the hours, not that rule." \
+            "" \
+            "ASKED BY: ${REQUESTER}" \
+            "WHY:      ${REASON}" \
+            "Request run: ${RUN_URL}" | head -c 950)
+          echo "Justification the approvers will see:"; echo "-----"; echo "$JUSTIFICATION"; echo "-----"
+          { echo "### Deploy window requested"; echo '```'; echo "$JUSTIFICATION"; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+          {
+            echo "start=$(date -u -d "@$START" +%Y-%m-%dT%H:%M:%SZ)"
+            echo "seconds=$((HOURS * 3600))"
+            echo "justification<<__JUSTIFICATION__"; echo "$JUSTIFICATION"; echo "__JUSTIFICATION__"
+          } >> "$GITHUB_OUTPUT"
+
+      - uses: google-github-actions/auth@c200f3691d83b41bf9bbd8638997a462592937ed # v2
+        with:
+          workload_identity_provider: ${{ inputs.wif_provider }}
+          service_account: ${{ inputs.service_account }}
+          project_id: ${{ inputs.project }}
+
+      - uses: google-github-actions/setup-gcloud@e427ad8a34f8676edf47cf7d7925499adf3eb74f # v2
+        with:
+          install_components: beta
+
+      - name: Request the window
+        env:
+          START: ${{ steps.window.outputs.start }}
+          SECONDS_WANTED: ${{ steps.window.outputs.seconds }}
+          JUSTIFICATION: ${{ steps.window.outputs.justification }}
+        run: |
+          set -euo pipefail
+          # Scheduling is beta-only in gcloud (grant.activationTrigger).
+          GRANT=$(gcloud beta pam grants create --entitlement="$ENTITLEMENT" --location=global \
+            --requested-duration="${SECONDS_WANTED}s" --scheduled-activation-time="$START" \
+            --justification="$JUSTIFICATION" --format='value(name)')
+          echo "Window requested: $GRANT"
+          echo "It needs its approvals before ${START}, or PAM drops it."
+          { echo; echo "Grant: \`$GRANT\` (approve before ${START})."; } >> "$GITHUB_STEP_SUMMARY"
