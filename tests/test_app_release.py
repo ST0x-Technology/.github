@@ -106,7 +106,11 @@ else:
 
 
 class PamGrantTest(unittest.TestCase):
-    def run_gate(self, state):
+    """A one-off grant belongs to the run whose justification it carries."""
+
+    RUN_LINE = 'Diff and logs: https://github.com/org/app/actions/runs/123'
+
+    def run_gate(self, state, run='123', close_fails=False, images=''):
         script = step_script(WORKFLOW, 'Await PAM approval')
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -117,9 +121,16 @@ args = sys.argv[1:]
 with open(os.environ['CALLS'], 'a') as log:
     log.write(json.dumps(args) + '\\n')
 if args[:3] == ['pam', 'grants', 'list']:
-    print('old-grant ' + os.environ['OLD_STATE'])
+    text = 'PRODUCTION DEPLOY bot VM in production from org/app.\\n\\nIMAGE: x\\n'
+    text += 'Diff and logs: https://github.com/org/app/actions/runs/' + os.environ['OLD_RUN']
+    print(json.dumps([{'name': 'old-grant', 'state': os.environ['OLD_STATE'],
+                       'justification': {'unstructuredJustification': text}}]))
 elif args[:4] == ['pam', 'grants', 'describe', 'old-grant']:
     print('ACTIVE')
+elif args[:3] == ['pam', 'grants', 'revoke'] or args[:4] == ['beta', 'pam', 'grants', 'withdraw']:
+    if os.environ['CLOSE_FAILS']:
+        print('PERMISSION_DENIED: no grants.revoke', file=sys.stderr)
+        sys.exit(1)
 elif args[:3] == ['pam', 'grants', 'create']:
     print('new-grant')
 elif args[:4] == ['pam', 'grants', 'describe', 'new-grant']:
@@ -133,12 +144,13 @@ else:
             fake.chmod(0o755)
             (root / 'git').write_text('#!/bin/sh\nprintf "replacement release\\n"\n')
             (root / 'git').chmod(0o755)
-            (root / 'want.env').write_text('')
+            (root / 'want.env').write_text(images)
             summary = root / 'summary'
             calls = root / 'calls'
             env = os.environ | {
                 'PATH': str(root) + os.pathsep + os.environ['PATH'],
-                'CALLS': str(calls), 'OLD_STATE': state,
+                'CALLS': str(calls), 'OLD_STATE': state, 'OLD_RUN': run,
+                'CLOSE_FAILS': '1' if close_fails else '',
                 'ENTITLEMENT': 'app-deploy', 'RUNTIME': 'bot-vm',
                 'CONFIG_FILE': '', 'CONFIG_BUCKET': 'bucket',
                 'RUNNER_TEMP': directory, 'GITHUB_STEP_SUMMARY': str(summary),
@@ -154,24 +166,73 @@ else:
             recorded = [json.loads(line) for line in calls.read_text().splitlines()]
             return result, recorded
 
-    def test_active_grant_is_reused(self):
-        result, calls = self.run_gate('ACTIVE')
-        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        self.assertFalse(any(call[:3] == ['pam', 'grants', 'revoke'] for call in calls))
-        self.assertFalse(any(call[:3] == ['pam', 'grants', 'create'] for call in calls))
+    @staticmethod
+    def closed(calls):
+        return [call for call in calls
+                if call[:3] == ['pam', 'grants', 'revoke'] or call[:4] == ['beta', 'pam', 'grants', 'withdraw']]
 
-    def test_pending_grant_is_reused(self):
-        result, calls = self.run_gate('APPROVAL_AWAITED')
+    @staticmethod
+    def created(calls):
+        return [call for call in calls if call[:3] == ['pam', 'grants', 'create']]
+
+    def test_this_runs_grant_is_reused(self):
+        for state in ('ACTIVE', 'APPROVAL_AWAITED', 'ACTIVATING'):
+            with self.subTest(state=state):
+                result, calls = self.run_gate(state)
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertIn("Reusing this run's open grant: old-grant", result.stdout)
+                self.assertEqual(self.closed(calls), [])
+                self.assertEqual(self.created(calls), [])
+
+    def test_another_runs_active_grant_is_revoked_before_asking(self):
+        for state in ('ACTIVE', 'ACTIVATING'):
+            with self.subTest(state=state):
+                result, calls = self.run_gate(state, run='99')
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertEqual([call[:4] for call in self.closed(calls)],
+                                 [['pam', 'grants', 'revoke', 'old-grant']])
+                self.assertEqual(len(self.created(calls)), 1)
+                self.assertIn('left by another run', result.stdout)
+
+    def test_another_runs_pending_grant_is_withdrawn_before_asking(self):
+        result, calls = self.run_gate('APPROVAL_AWAITED', run='99')
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        self.assertFalse(any(call[:3] == ['pam', 'grants', 'revoke'] for call in calls))
-        self.assertFalse(any(call[:3] == ['pam', 'grants', 'create'] for call in calls))
+        self.assertEqual([call[:5] for call in self.closed(calls)],
+                         [['beta', 'pam', 'grants', 'withdraw', 'old-grant']])
+        self.assertEqual(len(self.created(calls)), 1)
+
+    def test_a_run_id_prefix_is_not_this_run(self):
+        result, calls = self.run_gate('ACTIVE', run='1234')
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(len(self.closed(calls)), 1)
+        self.assertEqual(len(self.created(calls)), 1)
+
+    def test_a_leftover_that_cannot_be_closed_stops_the_release(self):
+        result, calls = self.run_gate('ACTIVE', run='99', close_fails=True)
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn('was not revoked here', result.stdout)
+        self.assertIn('no grants.revoke', result.stdout)
+        self.assertEqual(self.created(calls), [])
+
+    def test_a_cut_justification_still_ends_with_the_run_line(self):
+        images = ''.join(f'IMAGE_{n}=europe-west3-docker.pkg.dev/p/r/app-{n}@sha256:{str(n) * 64}\n'
+                         for n in range(8))
+        result, calls = self.run_gate('ENDED', images=images)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        justification = next(arg for arg in self.created(calls)[0] if arg.startswith('--justification='))
+        text = justification[len('--justification='):]
+        self.assertGreater(len(text), 900)
+        self.assertLessEqual(len(text), 1000)
+        self.assertTrue(text.endswith('\n' + self.RUN_LINE), text[-120:])
+        self.assertIn('IMAGE_0 ROLL', text)
 
 
 class DeployWindowReleaseTest(unittest.TestCase):
     """A release inside an approved deploy window neither asks nor waits."""
 
     def run_gate(self, windows=(), list_error='', window_entitlement='deploy-window', ref='', image_tag='',
-                 github_ref='refs/heads/main', head=COMMIT, tag_commit='', merged=True):
+                 github_ref='refs/heads/main', head=COMMIT, tag_commit='', merged=True,
+                 github_sha=COMMIT, peeled=''):
         script = step_script(WORKFLOW, 'Await PAM approval')
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -210,6 +271,7 @@ else:
             (root / 'git').write_text('#!/bin/sh\n'
                                       'case "$*" in "rev-parse HEAD") exec printf "%s\\n" "$HEAD_SHA" ;;\n'
                                       '  "rev-parse -q --verify refs/tags/"*) exec printf "%s\\n" "$TAG_SHA" ;;\n'
+                                      '  "rev-parse -q --verify "*"^{commit}") exec printf "%s\\n" "${PEELED_SHA:-$GITHUB_SHA}" ;;\n'
                                       '  "fetch -q --depth=500 origin main") exit 0 ;;\n'
                                       '  "merge-base --is-ancestor "*) exit "$NOT_MERGED" ;; esac\n'
                                       'printf "replacement release\\n"\n')
@@ -222,7 +284,8 @@ else:
                 'CALLS': str(calls), 'WINDOWS': json.dumps(windows), 'LIST_ERROR': list_error,
                 'ENTITLEMENT': 'app-deploy', 'WINDOW_ENTITLEMENT': window_entitlement, 'RUNTIME': 'bot-vm',
                 'REF_INPUT': ref, 'IMAGE_TAG_INPUT': image_tag, 'DEFAULT_BRANCH': 'main',
-                'GITHUB_REF': github_ref, 'GITHUB_SHA': COMMIT, 'HEAD_SHA': head, 'TAG_SHA': tag_commit,
+                'GITHUB_REF': github_ref, 'GITHUB_SHA': github_sha, 'HEAD_SHA': head, 'TAG_SHA': tag_commit,
+                'PEELED_SHA': peeled,
                 'NOT_MERGED': '0' if merged else '1',
                 'CONFIG_FILE': '', 'CONFIG_BUCKET': 'bucket',
                 'RUNNER_TEMP': directory, 'GITHUB_STEP_SUMMARY': str(root / 'summary'),
@@ -275,6 +338,11 @@ else:
                      dict(ref='v1.1.0', image_tag='v1.1.0', head='d' * 40, tag_commit='d' * 40)):
             with self.subTest(**case):
                 self.assert_skipped(*self.run_gate([('ACTIVE', 180)], **case))
+
+    def test_window_covers_an_annotated_tag_push(self):
+        tag_object = 'c' * 40
+        self.assert_skipped(*self.run_gate(windows=[('ACTIVE', 120)], github_ref='refs/tags/v1.2.0',
+                                           github_sha=tag_object, peeled=COMMIT, head=COMMIT))
 
     def test_window_does_not_cover_other_code_or_config(self):
         for case in (dict(github_ref='refs/heads/feature'),

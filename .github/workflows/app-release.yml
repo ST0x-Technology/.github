@@ -435,9 +435,12 @@ jobs:
           fi
           IN_WINDOW_SCOPE=false
           HEAD_COMMIT=$(git rev-parse HEAD 2>/dev/null || true)
+          # On an annotated tag push GITHUB_SHA is the tag object, not the
+          # commit (actions/runner#712): peel it before comparing.
+          RUN_COMMIT=$(git rev-parse -q --verify "${GITHUB_SHA:-}^{commit}" 2>/dev/null || echo "${GITHUB_SHA:-}")
           case "${GITHUB_REF:-}" in
             refs/tags/v[0-9]*|"refs/heads/${DEFAULT_BRANCH:-}")
-              [ -n "$HEAD_COMMIT" ] && [ "$HEAD_COMMIT" = "${GITHUB_SHA:-}" ] && IN_WINDOW_SCOPE=true ;;
+              [ -n "$HEAD_COMMIT" ] && [ "$HEAD_COMMIT" = "$RUN_COMMIT" ] && IN_WINDOW_SCOPE=true ;;
           esac
           # A rollback names its tag in full (refs/tags/v1.2.0) or short
           # (v1.2.0); the short form is looked up under refs/tags/ only, so
@@ -488,12 +491,9 @@ jobs:
             fi
           fi
 
-          GRANT=$(gcloud pam grants list --entitlement="$ENTITLEMENT" --location=global \
-            --format='value(name,state)' 2>/dev/null \
-            | awk '$2 == "ACTIVE" || $2 == "APPROVAL_AWAITED" || $2 == "ACTIVATING" {print $1; exit}') || true
-
           SUBJECT=$(git log -1 --format=%s 2>/dev/null | ascii | cut -c1-120 || true)
           RUN_URL="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+          RUN_LINE="Diff and logs: $RUN_URL"
           IMAGE_LINES=""
           if [ "$RUNTIME" = "cloud-run" ]; then
             live=$(gcloud run services describe "$SERVICE" --region "$REGION" --format='value(spec.template.spec.containers[0].image)' 2>/dev/null || true)
@@ -518,6 +518,8 @@ jobs:
           if [ -n "$CONFIG_FILE" ]; then
             CONFIG_LINE="CONFIG ${CONFIG_SECRET}: v${CONFIG_PREVIOUS} -> ${CONFIG_REUSE:+v}${CONFIG_REUSE:-NEW VERSION} (${CONFIG_DIFFSTAT})"
           fi
+          # The run line stays whole at the end whatever the cut: it is what
+          # binds a grant to this run below.
           JUSTIFICATION=$(printf '%s\n' \
             "PRODUCTION DEPLOY ${SERVICE:-bot VM} in ${PROJECT} from ${GITHUB_REPOSITORY}." \
             "Approving lets the app's releaser roll the plane once (grant revoked on success)." \
@@ -526,13 +528,54 @@ jobs:
             "$CONFIG_LINE" \
             "" \
             "CHANGE: ${SUBJECT:-(n/a)}" \
-            "BY:     @${GITHUB_ACTOR} (${GITHUB_REF_NAME})" \
-            "Diff and logs: $RUN_URL" | ascii | head -c 950)
+            "BY:     @${GITHUB_ACTOR} (${GITHUB_REF_NAME})" | ascii | head -c $((940 - ${#RUN_LINE})))
+          JUSTIFICATION="${JUSTIFICATION}"$'\n'"${RUN_LINE}"
           echo "Justification the approvers will see:"; echo "-----"; echo "$JUSTIFICATION"; echo "-----"
           { echo "### PAM justification"; echo '```'; echo "$JUSTIFICATION"; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
 
+          # An open grant is reused only when its justification carries this
+          # run's own line, so a re-run after a timed-out approval or a
+          # failed roll asks nobody twice. A grant left by ANOTHER run is a
+          # leftover (the callers serialise production runs): its approvers
+          # were told that run's content, so it is closed here before this
+          # run asks with its own text, instead of rolling this release on
+          # the previous one's approval. PAM allows one open grant per
+          # requester and entitlement, so the leftover must go first.
+          GRANT=""
+          if ! GRANTS=$(gcloud pam grants list --entitlement="$ENTITLEMENT" --location=global --format=json 2>"$RUNNER_TEMP/grants.err"); then
+            echo "::warning::could not list ${ENTITLEMENT} grants; asking for a new one: $(head -c 300 "$RUNNER_TEMP/grants.err")"
+            GRANTS="[]"
+          fi
+          while IFS=$'\t' read -r name state owner first; do
+            [ -n "$name" ] || continue
+            if [ "$owner" = "this-run" ]; then
+              [ -n "$GRANT" ] || GRANT="$name"
+              continue
+            fi
+            ok=true
+            if [ "$state" = "APPROVAL_AWAITED" ]; then
+              past=withdrawn; err=$(gcloud beta pam grants withdraw "$name" 2>&1 >/dev/null) || ok=false
+            else
+              past=revoked; err=$(gcloud pam grants revoke "$name" --reason="left by another run; closed by $RUN_URL" 2>&1 >/dev/null) || ok=false
+            fi
+            if $ok; then
+              echo "::notice::closed (${past}) the ${state} grant ${name##*/} left by another run (\"${first}\")."
+              echo "Closed the ${state} grant \`${name##*/}\` left by another run (\"${first}\")." >> "$GITHUB_STEP_SUMMARY"
+            else
+              echo "::error::grant ${name} is ${state} with another run's justification (\"${first}\") and was not ${past} here: ${err}. Have an approver deny or revoke it in Privileged Access Manager, or wait for it to end, then re-run."
+              exit 1
+            fi
+          done < <(jq -r --arg line "$RUN_LINE" '
+            (if type == "array" then . else [] end)[]
+            | select(.state == "ACTIVE" or .state == "ACTIVATING" or .state == "APPROVAL_AWAITED")
+            | (.justification.unstructuredJustification // "") as $j
+            | [.name, .state,
+               (if ($j | split("\n") | index($line)) != null then "this-run" else "another-run" end),
+               ($j | split("\n") | .[0] // "" | .[0:80])]
+            | @tsv' <<<"${GRANTS:-[]}")
+
           if [ -n "$GRANT" ]; then
-            echo "Reusing open grant: $GRANT"
+            echo "Reusing this run's open grant: $GRANT"
           else
             GRANT=$(gcloud pam grants create --entitlement="$ENTITLEMENT" --location=global \
               --requested-duration=3600s --justification="$JUSTIFICATION" --format='value(name)')
@@ -548,7 +591,7 @@ jobs:
               *) echo "  state=${STATE} (poll ${i}/120)"; sleep 30 ;;
             esac
           done
-          echo "::error::No approval within 60 minutes. Re-run this job once approved (an open grant is re-used)."
+          echo "::error::No approval within 60 minutes. Re-run this job once approved (this run's grant is re-used)."
           exit 1
 
       - name: Publish config version
@@ -649,7 +692,8 @@ jobs:
           exit 1
 
       # A grant is a 60-minute window, not one run; close it once the roll
-      # is done. On failure it survives, so a re-run needs no new approval.
+      # is done. On failure it survives for a re-run of this same run (no
+      # new approval); any other run closes it and asks with its own text.
       - name: Revoke PAM grant (success only)
         if: success() && inputs.pam_entitlement != ''
         run: |
