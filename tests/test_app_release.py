@@ -110,7 +110,9 @@ class PamGrantTest(unittest.TestCase):
 
     RUN_LINE = 'Diff and logs: https://github.com/org/app/actions/runs/123'
 
-    def run_gate(self, state, run='123', close_fails=False, images=''):
+    RELEASER = 'app-releaser@artifacts.iam.gserviceaccount.com'
+
+    def run_gate(self, state, run='123', close_fails='', images='', requester=RELEASER, list_fails=False):
         script = step_script(WORKFLOW, 'Await PAM approval')
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -121,15 +123,22 @@ args = sys.argv[1:]
 with open(os.environ['CALLS'], 'a') as log:
     log.write(json.dumps(args) + '\\n')
 if args[:3] == ['pam', 'grants', 'list']:
+    if os.environ['LIST_FAILS']:
+        print('PERMISSION_DENIED: grants.list', file=sys.stderr)
+        sys.exit(1)
     text = 'PRODUCTION DEPLOY bot VM in production from org/app.\\n\\nIMAGE: x\\n'
     text += 'Diff and logs: https://github.com/org/app/actions/runs/' + os.environ['OLD_RUN']
-    print(json.dumps([{'name': 'old-grant', 'state': os.environ['OLD_STATE'],
+    print(json.dumps([{'name': 'old-grant', 'state': os.environ['OLD_STATE'], 'requester': os.environ['REQUESTER'],
                        'justification': {'unstructuredJustification': text}}]))
 elif args[:4] == ['pam', 'grants', 'describe', 'old-grant']:
     print('ACTIVE')
-elif args[:3] == ['pam', 'grants', 'revoke'] or args[:4] == ['beta', 'pam', 'grants', 'withdraw']:
-    if os.environ['CLOSE_FAILS']:
+elif args[:3] == ['pam', 'grants', 'revoke']:
+    if os.environ['CLOSE_FAILS'] in ('revoke', 'both'):
         print('PERMISSION_DENIED: no grants.revoke', file=sys.stderr)
+        sys.exit(1)
+elif args[:4] == ['beta', 'pam', 'grants', 'withdraw']:
+    if os.environ['CLOSE_FAILS'] in ('withdraw', 'both'):
+        print('FAILED_PRECONDITION: not the requester', file=sys.stderr)
         sys.exit(1)
 elif args[:3] == ['pam', 'grants', 'create']:
     print('new-grant')
@@ -149,8 +158,9 @@ else:
             calls = root / 'calls'
             env = os.environ | {
                 'PATH': str(root) + os.pathsep + os.environ['PATH'],
-                'CALLS': str(calls), 'OLD_STATE': state, 'OLD_RUN': run,
-                'CLOSE_FAILS': '1' if close_fails else '',
+                'CALLS': str(calls), 'OLD_STATE': state, 'OLD_RUN': run, 'REQUESTER': requester,
+                'CLOSE_FAILS': close_fails, 'LIST_FAILS': '1' if list_fails else '',
+                'RELEASER': self.RELEASER.upper(),
                 'ENTITLEMENT': 'app-deploy', 'RUNTIME': 'bot-vm',
                 'CONFIG_FILE': '', 'CONFIG_BUCKET': 'bucket',
                 'RUNNER_TEMP': directory, 'GITHUB_STEP_SUMMARY': str(summary),
@@ -207,11 +217,34 @@ else:
         self.assertEqual(len(self.closed(calls)), 1)
         self.assertEqual(len(self.created(calls)), 1)
 
+    def test_a_denied_revoke_falls_back_to_the_requesters_withdraw(self):
+        result, calls = self.run_gate('ACTIVE', run='99', close_fails='revoke')
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual([call[:4] for call in self.closed(calls)],
+                         [['pam', 'grants', 'revoke', 'old-grant'], ['beta', 'pam', 'grants', 'withdraw']])
+        self.assertIn('by withdraw.', result.stdout)
+        self.assertEqual(len(self.created(calls)), 1)
+
     def test_a_leftover_that_cannot_be_closed_stops_the_release(self):
-        result, calls = self.run_gate('ACTIVE', run='99', close_fails=True)
+        result, calls = self.run_gate('ACTIVE', run='99', close_fails='both')
         self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
-        self.assertIn('was not revoked here', result.stdout)
+        self.assertIn('could not be closed here', result.stdout)
         self.assertIn('no grants.revoke', result.stdout)
+        self.assertIn('not the requester', result.stdout)
+        self.assertEqual(self.created(calls), [])
+
+    def test_another_requesters_grant_is_left_alone(self):
+        for state, run in (('ACTIVE', '99'), ('APPROVAL_AWAITED', '123')):
+            with self.subTest(state=state, run=run):
+                result, calls = self.run_gate(state, run=run, requester='operator@example.com')
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertEqual(self.closed(calls), [])
+                self.assertEqual(len(self.created(calls)), 1)
+
+    def test_an_unreadable_listing_stops_the_release(self):
+        result, calls = self.run_gate('ACTIVE', list_fails=True)
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn('cannot tell whether an open one is its own', result.stdout)
         self.assertEqual(self.created(calls), [])
 
     def test_a_cut_justification_still_ends_with_the_run_line(self):
@@ -343,6 +376,8 @@ else:
         tag_object = 'c' * 40
         self.assert_skipped(*self.run_gate(windows=[('ACTIVE', 120)], github_ref='refs/tags/v1.2.0',
                                            github_sha=tag_object, peeled=COMMIT, head=COMMIT))
+        self.assert_asked(*self.run_gate(windows=[('ACTIVE', 120)], github_ref='refs/tags/v1.2.0',
+                                         github_sha=tag_object, peeled='d' * 40, head=COMMIT))
 
     def test_window_does_not_cover_other_code_or_config(self):
         for case in (dict(github_ref='refs/heads/feature'),
