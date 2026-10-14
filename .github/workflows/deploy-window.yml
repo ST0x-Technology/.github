@@ -143,6 +143,18 @@ jobs:
           JUSTIFICATION: ${{ steps.window.outputs.justification }}
         run: |
           set -euo pipefail
+          # PAM keeps one grant per requester on an entitlement, and every
+          # window on this plane is the releaser's: while one is waiting,
+          # scheduled or open, a second request fails. Say which one and
+          # when it ends, instead of PAM's own error.
+          OPEN=$(gcloud beta pam grants list --entitlement="$ENTITLEMENT" --location=global --format=json 2>/dev/null \
+            | jq -r '[.[] | select(.state == "APPROVAL_AWAITED" or .state == "SCHEDULED" or .state == "ACTIVATING" or .state == "ACTIVE")
+                | "\(.name | split("/") | last) (\(.state), \(.requestedDuration), starts \(.activationTrigger.requestedActivationTime // "on approval"))"]
+                | join("; ")') || OPEN=""
+          if [ -n "$OPEN" ]; then
+            echo "::error::a deploy window is already booked on ${ENTITLEMENT}: ${OPEN}. One window at a time per plane; ask again once it has ended, or have an approver revoke it."
+            exit 1
+          fi
           # Scheduling is beta-only in gcloud (grant.activationTrigger).
           GRANT=$(gcloud beta pam grants create --entitlement="$ENTITLEMENT" --location=global \
             --requested-duration="${SECONDS_WANTED}s" --scheduled-activation-time="$START" \
