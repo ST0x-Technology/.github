@@ -398,6 +398,7 @@ else:
             env = os.environ | {
                 'PATH': str(root) + os.pathsep + os.environ['PATH'], 'CALLS': str(calls),
                 'OPEN_GRANTS': json.dumps(open_grants), 'ENTITLEMENT': 'deploy-window', 'LIST_FAILS': '1' if list_fails else '',
+                'RUNNER_TEMP': directory,
                 'START': start, 'SECONDS_WANTED': '14400', 'JUSTIFICATION': 'PRODUCTION DEPLOY WINDOW for org/app',
                 'GITHUB_STEP_SUMMARY': str(root / 'summary'),
             }
