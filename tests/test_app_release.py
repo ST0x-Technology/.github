@@ -367,5 +367,67 @@ class DeployWindowRequestTest(unittest.TestCase):
                 self.assertNotIn('seconds=', output)
 
 
+
+class DeployWindowRequestStepTest(unittest.TestCase):
+    """The request itself: one window per plane at a time, said plainly."""
+
+    def run_request(self, open_grants, list_fails=False):
+        import datetime
+        script = step_script(DEPLOY_WINDOW, 'Request the window')
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            fake = root / 'gcloud'
+            fake.write_text('''#!/usr/bin/env python3
+import json, os, sys
+args = sys.argv[1:]
+with open(os.environ['CALLS'], 'a') as log:
+    log.write(json.dumps(args) + '\\n')
+if args[:4] == ['beta', 'pam', 'grants', 'list']:
+    if os.environ.get('LIST_FAILS'):
+        print('PERMISSION_DENIED: cannot list grants', file=sys.stderr); sys.exit(1)
+    print(os.environ['OPEN_GRANTS'])
+elif args[:4] == ['beta', 'pam', 'grants', 'create']:
+    print('projects/p/locations/global/entitlements/deploy-window/grants/new')
+else:
+    print('unexpected gcloud call: ' + repr(args), file=sys.stderr)
+    sys.exit(99)
+''')
+            fake.chmod(0o755)
+            calls = root / 'calls'
+            start = (datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(days=1)).strftime('%Y-%m-%dT%H:%M:%SZ')
+            env = os.environ | {
+                'PATH': str(root) + os.pathsep + os.environ['PATH'], 'CALLS': str(calls),
+                'OPEN_GRANTS': json.dumps(open_grants), 'ENTITLEMENT': 'deploy-window', 'LIST_FAILS': '1' if list_fails else '',
+                'RUNNER_TEMP': directory,
+                'START': start, 'SECONDS_WANTED': '14400', 'JUSTIFICATION': 'PRODUCTION DEPLOY WINDOW for org/app',
+                'GITHUB_STEP_SUMMARY': str(root / 'summary'),
+            }
+            result = subprocess.run(['bash', '-euo', 'pipefail', '-c', script], env=env, text=True, capture_output=True)
+            recorded = [json.loads(line) for line in calls.read_text().splitlines()] if calls.exists() else []
+            return result, recorded
+
+    def test_a_free_plane_gets_its_window(self):
+        result, calls = self.run_request([{'name': 'projects/p/locations/global/entitlements/deploy-window/grants/old', 'state': 'ENDED', 'requestedDuration': '14400s'}])
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertTrue(any(call[:4] == ['beta', 'pam', 'grants', 'create'] for call in calls))
+        self.assertIn('Window requested', result.stdout)
+
+    def test_a_booked_plane_refuses_a_second_window(self):
+        for state in ('APPROVAL_AWAITED', 'SCHEDULED', 'ACTIVE', 'REVOKING', 'WITHDRAWING'):
+            with self.subTest(state):
+                result, calls = self.run_request([{'name': 'projects/p/locations/global/entitlements/deploy-window/grants/sat', 'state': state, 'requestedDuration': '14400s',
+                                                   'activationTrigger': {'requestedActivationTime': '2026-10-18T13:00:00Z'}}])
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn('already booked', result.stdout)
+                self.assertIn('sat (' + state, result.stdout)
+                self.assertFalse(any(call[:4] == ['beta', 'pam', 'grants', 'create'] for call in calls))
+
+    def test_a_failed_listing_never_asks_blind(self):
+        result, calls = self.run_request([], list_fails=True)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('not asking for one blind', result.stdout)
+        self.assertFalse(any(call[:4] == ['beta', 'pam', 'grants', 'create'] for call in calls))
+
+
 if __name__ == '__main__':
     unittest.main()

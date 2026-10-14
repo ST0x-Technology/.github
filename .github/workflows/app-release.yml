@@ -177,9 +177,13 @@ jobs:
     steps:
       # The config comes from the ref being released: the tag for a code
       # release or rollback, the default branch for a config-only release.
+      # The commit this run was started for, not the tip of its branch at
+      # checkout time: a config-only release that waited in the production
+      # queue while another merge landed would otherwise read the newer
+      # config and fall outside what a deploy window covers.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: ${{ inputs.ref != '' && inputs.ref || github.ref }}
+          ref: ${{ inputs.ref != '' && inputs.ref || github.sha }}
 
       - id: auth
         uses: google-github-actions/auth@c200f3691d83b41bf9bbd8638997a462592937ed # v2

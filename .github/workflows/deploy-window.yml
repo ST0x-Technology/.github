@@ -143,6 +143,21 @@ jobs:
           JUSTIFICATION: ${{ steps.window.outputs.justification }}
         run: |
           set -euo pipefail
+          # PAM keeps one grant per requester on an entitlement, and every
+          # window on this plane is the releaser's: while one is waiting,
+          # scheduled or open, a second request fails. Say which one and
+          # when it ends, instead of PAM's own error.
+          if ! GRANTS=$(gcloud beta pam grants list --entitlement="$ENTITLEMENT" --location=global --format=json 2>"$RUNNER_TEMP/list.err"); then
+            echo "::error::could not list the windows on ${ENTITLEMENT}, so not asking for one blind: $(head -c 300 "$RUNNER_TEMP/list.err")"; exit 1
+          fi
+          # REVOKING and WITHDRAWING still hold the slot until PAM is done.
+          OPEN=$(jq -r '[.[] | select(.state == "APPROVAL_AWAITED" or .state == "SCHEDULED" or .state == "ACTIVATING" or .state == "ACTIVE" or .state == "REVOKING" or .state == "WITHDRAWING")
+                | "\(.name | split("/") | last) (\(.state), \(.requestedDuration), starts \(.activationTrigger.requestedActivationTime // "on approval"))"]
+                | join("; ")' <<<"$GRANTS")
+          if [ -n "$OPEN" ]; then
+            echo "::error::a deploy window is already booked on ${ENTITLEMENT}: ${OPEN}. One window at a time per plane; ask again once it has ended, or have an approver revoke it."
+            exit 1
+          fi
           # Scheduling is beta-only in gcloud (grant.activationTrigger).
           GRANT=$(gcloud beta pam grants create --entitlement="$ENTITLEMENT" --location=global \
             --requested-duration="${SECONDS_WANTED}s" --scheduled-activation-time="$START" \
